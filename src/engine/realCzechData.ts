@@ -137,6 +137,7 @@ function latToTileFrac(lat: number, z: number): number {
 }
 
 export function pickTerrariumZoom(cameraZoom: number): number {
+  if (cameraZoom >= 0.085) return 13;
   if (cameraZoom >= 0.024) return 12;
   if (cameraZoom >= 0.011) return 11;
   return 10;
@@ -536,6 +537,7 @@ export function ensureWorldDetailBlocksForViewport(
 
 export function pickWorldTerrariumZoom(cameraZoom: number): number {
   // Scale 1 : 3,000,000 corresponds to cameraZoom ~ 0.00126
+  if (cameraZoom >= 0.085) return 13;
   if (cameraZoom >= 0.032) return 12;
   if (cameraZoom >= 0.015) return 11;
   if (cameraZoom >= 0.006) return 10;

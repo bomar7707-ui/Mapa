@@ -40,6 +40,17 @@ import {
   pickWorldTerrariumZoom,
 } from '../engine/realCzechData';
 import {
+  ensureOsmVectorTilesForViewport,
+  pickOsmVectorZoom,
+} from '../engine/osmVectorTiles';
+import {
+  OsmRenderContext,
+  renderOsmBorders,
+  renderOsmHydrology,
+  renderOsmLandcoverAndUrban,
+  renderOsmTransport,
+} from '../engine/osmCanvasRenderer';
+import {
   CompiledWorldTerrain,
   GLOBAL_HEIGHT,
   GLOBAL_WIDTH,
@@ -544,6 +555,8 @@ function pickScaleBar(pxPerMeter: number): { label: string; px: number } {
   const targetPx = 124;
   const rawMeters = targetPx / pxPerMeter;
   const steps = [
+    50,
+    100,
     200,
     500,
     1000,
@@ -671,7 +684,7 @@ export const CzechMapCanvas = forwardRef<
   const activeWidth = mapScope === 'world' ? GLOBAL_WIDTH : WORLD_WIDTH;
   const activeHeight = mapScope === 'world' ? GLOBAL_HEIGHT : WORLD_HEIGHT;
   const minZoom = mapScope === 'world' ? 0.000018 : 0.0007;
-  const maxZoom = mapScope === 'world' ? 0.12 : 0.08;
+  const maxZoom = 0.45;
 
   const projectGeo = useCallback(
     (lon: number, lat: number): Point2D =>
@@ -764,7 +777,11 @@ export const CzechMapCanvas = forwardRef<
   }, [mapScope, viewportSize.width, viewportSize.height]);
 
   const czechTerrainRaster = useMemo(
-    () => buildCzechTerrainRaster(terrain, stylePreset, layers),
+    () =>
+      buildCzechTerrainRaster(terrain, stylePreset, {
+        ...layers,
+        forests: false,
+      }),
     [terrain, stylePreset, layers]
   );
 
@@ -784,6 +801,7 @@ export const CzechMapCanvas = forwardRef<
   } | null>(null);
   const [tileRevision, setTileRevision] = useState(0);
   const [blockRevision, setBlockRevision] = useState(0);
+  const [osmRevision, setOsmRevision] = useState(0);
 
   useEffect(() => {
     const thresholdZoom = mapScope === 'world' ? 0.00011 : 0.0036;
@@ -817,6 +835,10 @@ export const CzechMapCanvas = forwardRef<
           targetZ,
           realDataset?.dem
         );
+        const worldPatchLayers =
+          camera.zoom >= DETAIL_WORLD_ZOOM
+            ? { ...layers, forests: false }
+            : layers;
         const raster = rasterizeTerrainGrid(
           patch.elevationGrid,
           patch.hillshadeGrid,
@@ -824,7 +846,7 @@ export const CzechMapCanvas = forwardRef<
           patch.cols,
           patch.rows,
           stylePreset,
-          layers,
+          worldPatchLayers,
           true
         );
         if (!cancelled) {
@@ -868,7 +890,7 @@ export const CzechMapCanvas = forwardRef<
           patch.cols,
           patch.rows,
           stylePreset,
-          layers,
+          { ...layers, forests: false },
           false
         );
         if (!cancelled) {
@@ -1039,6 +1061,41 @@ export const CzechMapCanvas = forwardRef<
               1.8
             )
           : { loadedBlocks: [], activeMetas: [] };
+
+        // Stream high-detail OpenStreetMap vector tiles globally at detail scale (<= 1 : 3 000 000)
+        const worldOsmTargetZ = isDetailScale
+          ? pickOsmVectorZoom(viewMaxLon - viewMinLon, 7, 14)
+          : 7;
+        const { tiles: worldOsmTiles } = isDetailScale
+          ? ensureOsmVectorTilesForViewport(
+              viewMinLon,
+              viewMaxLon,
+              viewMinLat,
+              viewMaxLat,
+              worldOsmTargetZ,
+              () => setOsmRevision((v) => v + 1)
+            )
+          : { tiles: [] };
+        const worldHasOsm = worldOsmTiles.length > 0;
+        const worldOsmRc: OsmRenderContext = {
+          ctx,
+          width,
+          height,
+          zoom: cam.zoom,
+          targetZ: worldOsmTargetZ,
+          stylePreset,
+          pal,
+          layers,
+          projectGeo: geoToGlobalWorld,
+          wxToSx,
+          wyToSy,
+          tryPlaceBox,
+        };
+
+        // 1bW. Real OSM Forests, Wetlands, Glaciers, Protected Parks, Built-up Urban & Buildings
+        if (isDetailScale && worldHasOsm) {
+          renderOsmLandcoverAndUrban(worldOsmTiles, worldOsmRc);
+        }
 
         // 2W. WGS84 Global Graticule (adaptive 30° / 15° / 5° / 1° / 0.5° / 0.25° / 0.1°)
         if (layers.graticule) {
@@ -1238,7 +1295,7 @@ export const CzechMapCanvas = forwardRef<
         }
 
         // 4W. Regional / Provincial / District Borders at Detail Scale (<= 1 : 3 000 000)
-        if (isDetailScale && layers.districts) {
+        if (isDetailScale && layers.districts && !worldHasOsm) {
           if (loadedBlocks.length > 0) {
             ctx.save();
             ctx.strokeStyle = pal.regionBorder;
@@ -1308,46 +1365,55 @@ export const CzechMapCanvas = forwardRef<
           }
         }
 
-        // 5W. World Country Borders (10m detailed borders at <= 1 : 3 000 000; 50m overview borders hidden in detail view)
-        if (layers.borders) {
+        // 5W. World Country Borders & Coastlines (OSM precision at <= 1 : 3 000 000; 50m overview borders hidden in detail view)
+        if (layers.borders || (isDetailScale && layers.districts && worldHasOsm)) {
           ctx.save();
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
           if (isDetailScale) {
-            // 1) Draw 10m detailed coastlines and international land borders from active logical blocks
-            for (const blk of loadedBlocks) {
-              if (!blk.borders) continue;
-              for (const bnd of blk.borders) {
-                if (!bboxVisible(bnd.b)) continue;
-                const isCoast = bnd.c === 1;
-                for (const line of bnd.l) {
-                  if (line.length < 2) continue;
-                  ctx.beginPath();
-                  line.forEach(([lon, lat], i) => {
-                    const wPt = geoToGlobalWorld(lon, lat);
-                    const sx = wxToSx(wPt.x);
-                    const sy = wyToSy(wPt.y);
-                    if (i === 0) ctx.moveTo(sx, sy);
-                    else ctx.lineTo(sx, sy);
-                  });
-                  if (isCoast) {
-                    ctx.strokeStyle = pal.waterStroke;
-                    ctx.lineWidth = 1.15;
-                    ctx.stroke();
-                  } else {
-                    ctx.strokeStyle = pal.borderOuter;
-                    ctx.lineWidth = 3.6;
-                    ctx.stroke();
-                    ctx.strokeStyle = pal.borderInner;
-                    ctx.lineWidth = 1.65;
-                    ctx.stroke();
+            // 1) Keep crisp 10m coastlines from active logical blocks (and fallback borders if OSM tile still loading)
+            if (layers.borders) {
+              for (const blk of loadedBlocks) {
+                if (!blk.borders) continue;
+                for (const bnd of blk.borders) {
+                  if (!bboxVisible(bnd.b)) continue;
+                  const isCoast = bnd.c === 1;
+                  if (!isCoast && worldHasOsm) continue;
+                  for (const line of bnd.l) {
+                    if (line.length < 2) continue;
+                    ctx.beginPath();
+                    line.forEach(([lon, lat], i) => {
+                      const wPt = geoToGlobalWorld(lon, lat);
+                      const sx = wxToSx(wPt.x);
+                      const sy = wyToSy(wPt.y);
+                      if (i === 0) ctx.moveTo(sx, sy);
+                      else ctx.lineTo(sx, sy);
+                    });
+                    if (isCoast) {
+                      ctx.strokeStyle = pal.waterStroke;
+                      ctx.lineWidth = 1.15;
+                      ctx.stroke();
+                    } else {
+                      ctx.strokeStyle = pal.borderOuter;
+                      ctx.lineWidth = 3.6;
+                      ctx.stroke();
+                      ctx.strokeStyle = pal.borderInner;
+                      ctx.lineWidth = 1.65;
+                      ctx.stroke();
+                    }
                   }
                 }
               }
             }
 
-            // 2) Draw ultra-high-resolution 5,957-point official Czech national border when overlapping Czechia
-            if (overlapsCz && realDataset) {
+            // 2) Draw meter-accurate OSM international (level 2), regional (level 4), and district (level 6) borders
+            if (worldHasOsm) {
+              renderOsmBorders(worldOsmTiles, worldOsmRc, {
+                drawCountryBorders: layers.borders,
+                drawRegionalBorders: layers.districts,
+              });
+            } else if (layers.borders && overlapsCz && realDataset) {
+              // Fallback official Czech border while OSM tile loads
               ctx.beginPath();
               realDataset.admin.border.forEach(([lon, lat], idx) => {
                 const wPt = geoToGlobalWorld(lon, lat);
@@ -1364,7 +1430,7 @@ export const CzechMapCanvas = forwardRef<
               ctx.lineWidth = 1.75;
               ctx.stroke();
             }
-          } else if (worldDataset) {
+          } else if (layers.borders && worldDataset) {
             // Coarse 50m overview country borders (shown ONLY when scale > 1 : 3 000 000)
             for (const country of worldDataset.countries) {
               if (country.b && !bboxVisible(country.b)) continue;
@@ -1397,9 +1463,11 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 6W. Global Hydrology (50m overview -> 10m block detail at <= 1 : 3 000 000)
+        // 6W. Global Hydrology (50m overview -> OSM full river/stream/lake/pond detail at <= 1 : 3 000 000)
         if (layers.hydrology) {
-          if (isDetailScale && loadedBlocks.length > 0) {
+          if (isDetailScale && worldHasOsm) {
+            renderOsmHydrology(worldOsmTiles, worldOsmRc);
+          } else if (isDetailScale && loadedBlocks.length > 0) {
             for (const blk of loadedBlocks) {
               for (const lake of blk.lakes) {
                 if (!bboxVisible(lake.b)) continue;
@@ -1640,8 +1708,8 @@ export const CzechMapCanvas = forwardRef<
           }
         }
 
-        // 6bW. Global Built-up Urban Footprints at Detail Scale (<= 1 : 3 000 000)
-        if (isDetailScale && layers.cities) {
+        // 6bW. Global Built-up Urban Footprints fallback (when OSM tiles are still loading)
+        if (isDetailScale && layers.cities && !worldHasOsm) {
           ctx.save();
           ctx.fillStyle = pal.isDark
             ? 'rgba(203, 213, 225, 0.09)'
@@ -1689,8 +1757,13 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 7aW. Global Railway Network at Detail Scale (<= 1 : 3 000 000)
-        if (isDetailScale && layers.railways) {
+        // 7W. Global OSM Transport Network (Aeroways, Railways, Full Road Hierarchy, Shields & Street Names)
+        if (isDetailScale && worldHasOsm) {
+          renderOsmTransport(worldOsmTiles, worldOsmRc);
+        }
+
+        // 7aW. Global Railway Network fallback (while OSM tiles load)
+        if (isDetailScale && layers.railways && !worldHasOsm) {
           ctx.save();
           ctx.lineCap = 'butt';
           ctx.lineJoin = 'round';
@@ -1752,8 +1825,8 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 7bW. Global Motorways, Secondary Highways & Trunk Roads at Detail Scale (<= 1 : 3 000 000)
-        if (isDetailScale && layers.highways) {
+        // 7bW. Global Motorways & Trunk Roads fallback (while OSM tiles load)
+        if (isDetailScale && layers.highways && !worldHasOsm) {
           ctx.save();
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
@@ -2002,7 +2075,7 @@ export const CzechMapCanvas = forwardRef<
             ctx.fillText(name, lx, ly);
           };
 
-          if (isDetailScale && loadedBlocks.length > 0) {
+          if (isDetailScale && (loadedBlocks.length > 0 || worldHasOsm)) {
             // Progressive zoom thresholds and spatial spacing at detail scale (<= 1 : 3 000 000)
             const minCityDistPx =
               cam.zoom < 0.0018
@@ -2103,8 +2176,55 @@ export const CzechMapCanvas = forwardRef<
             // Sort unified candidates by importance: national capitals -> regional capitals -> population
             candidates.sort((a, b) => b.t - a.t || b.p - a.p);
 
+            const seenCityNames = new Set<string>();
             for (const c of candidates) {
+              seenCityNames.add(c.n.toLowerCase());
               tryDrawCity(c.x, c.y, c.n, c.p, c.t, minCityDistPx, false);
+            }
+
+            // Supplement close zoom (z >= 11) with OSM villages, hamlets & city districts
+            if (worldHasOsm && worldOsmTargetZ >= 11) {
+              const osmPlaceCandidates: {
+                lon: number;
+                lat: number;
+                name: string;
+                rank: number;
+                cls: string;
+              }[] = [];
+              for (const tile of worldOsmTiles) {
+                for (const pl of tile.places) {
+                  if (
+                    pl.lon < viewMinLon ||
+                    pl.lon > viewMaxLon ||
+                    pl.lat < viewMinLat ||
+                    pl.lat > viewMaxLat
+                  ) {
+                    continue;
+                  }
+                  if (
+                    worldOsmTargetZ < 12 &&
+                    (pl.cls === 'hamlet' || pl.cls === 'quarter')
+                  ) {
+                    continue;
+                  }
+                  const key = pl.name.toLowerCase();
+                  if (seenCityNames.has(key)) continue;
+                  seenCityNames.add(key);
+                  osmPlaceCandidates.push(pl);
+                }
+              }
+              osmPlaceCandidates.sort((a, b) => a.rank - b.rank);
+              for (const pl of osmPlaceCandidates) {
+                tryDrawCity(
+                  pl.lon,
+                  pl.lat,
+                  pl.name,
+                  pl.cls === 'town' ? 8000 : 800,
+                  0,
+                  Math.max(22, minCityDistPx),
+                  false
+                );
+              }
             }
           } else if (worldDataset) {
             const minCityDistPx =
@@ -2226,13 +2346,14 @@ export const CzechMapCanvas = forwardRef<
             ctx.fillText(label, lx, ly);
           };
 
-          if (isDetailScale && loadedBlocks.length > 0) {
+          if (isDetailScale && (loadedBlocks.length > 0 || worldHasOsm)) {
             const peakCandidates: {
               x: number;
               y: number;
               n: string;
               e: number;
             }[] = [];
+            const seenPeakNames = new Set<string>();
 
             for (const blk of loadedBlocks) {
               for (const peak of blk.peaks) {
@@ -2244,6 +2365,7 @@ export const CzechMapCanvas = forwardRef<
                 ) {
                   continue;
                 }
+                seenPeakNames.add(peak.n.toLowerCase());
                 peakCandidates.push(peak);
               }
             }
@@ -2258,7 +2380,32 @@ export const CzechMapCanvas = forwardRef<
                 ) {
                   continue;
                 }
+                seenPeakNames.add(peak.n.toLowerCase());
                 peakCandidates.push(peak);
+              }
+            }
+
+            if (worldHasOsm && worldOsmTargetZ >= 11) {
+              for (const tile of worldOsmTiles) {
+                for (const pk of tile.peaks) {
+                  if (
+                    pk.lon < viewMinLon ||
+                    pk.lon > viewMaxLon ||
+                    pk.lat < viewMinLat ||
+                    pk.lat > viewMaxLat
+                  ) {
+                    continue;
+                  }
+                  const key = pk.name.toLowerCase();
+                  if (seenPeakNames.has(key)) continue;
+                  seenPeakNames.add(key);
+                  peakCandidates.push({
+                    x: pk.lon,
+                    y: pk.lat,
+                    n: pk.name,
+                    e: pk.ele,
+                  });
+                }
               }
             }
 
@@ -2345,6 +2492,47 @@ export const CzechMapCanvas = forwardRef<
         // =====================================================================
         // CZECH REPUBLIC HIGH-PRECISION RENDERING PIPELINE (ČESKÁ REPUBLIKA)
         // =====================================================================
+        const czTlGeo = worldToGeo(
+          cam.cx - (width * 0.56) / cam.zoom,
+          cam.cy - (height * 0.56) / cam.zoom
+        );
+        const czBrGeo = worldToGeo(
+          cam.cx + (width * 0.56) / cam.zoom,
+          cam.cy + (height * 0.56) / cam.zoom
+        );
+        const czMinLon = Math.min(czTlGeo.lon, czBrGeo.lon);
+        const czMaxLon = Math.max(czTlGeo.lon, czBrGeo.lon);
+        const czMinLat = Math.min(czTlGeo.lat, czBrGeo.lat);
+        const czMaxLat = Math.max(czTlGeo.lat, czBrGeo.lat);
+        const czOsmTargetZ = pickOsmVectorZoom(czMaxLon - czMinLon, 7, 14);
+        const { tiles: czOsmTiles } = ensureOsmVectorTilesForViewport(
+          czMinLon,
+          czMaxLon,
+          czMinLat,
+          czMaxLat,
+          czOsmTargetZ,
+          () => setOsmRevision((v) => v + 1)
+        );
+        const czHasOsm = czOsmTiles.length > 0;
+        const czOsmRc: OsmRenderContext = {
+          ctx,
+          width,
+          height,
+          zoom: cam.zoom,
+          targetZ: czOsmTargetZ,
+          stylePreset,
+          pal,
+          layers,
+          projectGeo: geoToWorld,
+          wxToSx,
+          wyToSy,
+          tryPlaceBox,
+        };
+
+        // 1b. Real OSM Forests, Wetlands, NP/CHKO, Built-up Urban Footprints & Buildings
+        if (czHasOsm) {
+          renderOsmLandcoverAndUrban(czOsmTiles, czOsmRc);
+        }
 
         // 2. Soft cartographic mask outside Czech Republic border
         ctx.save();
@@ -2571,8 +2759,11 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 6. Hydrology: Reservoirs & Rivers (Real 10m NE + Czech tributaries/reservoirs)
+        // 6. Hydrology: OSM Rivers, Streams, Reservoirs & Ponds (with fallback while loading)
         if (layers.hydrology) {
+          if (czHasOsm) {
+            renderOsmHydrology(czOsmTiles, czOsmRc);
+          } else {
           if (realDataset) {
             for (const lake of realDataset.vectors.lakes) {
               for (const ring of lake.rings) {
@@ -2731,10 +2922,11 @@ export const CzechMapCanvas = forwardRef<
               ctx.restore();
             }
           }
+          }
         }
 
-        // 6b. Real Built-up Urban Footprints (218 urban polygons)
-        if (layers.cities) {
+        // 6b. Built-up Urban Footprints fallback (when OSM tiles are still loading)
+        if (layers.cities && !czHasOsm) {
           ctx.save();
           ctx.fillStyle = pal.isDark
             ? 'rgba(203, 213, 225, 0.09)'
@@ -2778,8 +2970,13 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 7a. Real Czech Railway Network (1,822 segments)
-        if (layers.railways && realDataset && cam.zoom >= 0.0022) {
+        // 7. OSM Full Transport Network (Aeroways, Railways, Motorways -> Local Streets, Shields & Street Names)
+        if (czHasOsm) {
+          renderOsmTransport(czOsmTiles, czOsmRc);
+        }
+
+        // 7a. Real Czech Railway Network fallback (while OSM tiles load)
+        if (layers.railways && !czHasOsm && realDataset && cam.zoom >= 0.0022) {
           ctx.save();
           ctx.lineCap = 'butt';
           ctx.lineJoin = 'round';
@@ -2811,8 +3008,8 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 7b. Motorways, Secondary Highways & Trunk Roads
-        if (layers.highways) {
+        // 7b. Motorways, Secondary Highways & Trunk Roads fallback (while OSM tiles load)
+        if (layers.highways && !czHasOsm) {
           if (realDataset) {
             ctx.save();
             ctx.lineCap = 'round';
@@ -3047,6 +3244,99 @@ export const CzechMapCanvas = forwardRef<
               ctx.fillStyle = pal.textPrimary;
               ctx.fillText(city.n, lx, ly);
             }
+
+            // Supplement close zoom (z >= 11) with OSM villages, hamlets & city quarters
+            if (czHasOsm && czOsmTargetZ >= 11) {
+              const seenCzNames = new Set(
+                realDataset.places.cities.map((c) => c.n.toLowerCase())
+              );
+              const osmExtraPlaces: {
+                lon: number;
+                lat: number;
+                name: string;
+                cls: string;
+                rank: number;
+              }[] = [];
+              for (const tile of czOsmTiles) {
+                for (const pl of tile.places) {
+                  if (
+                    pl.lon < czMinLon ||
+                    pl.lon > czMaxLon ||
+                    pl.lat < czMinLat ||
+                    pl.lat > czMaxLat
+                  ) {
+                    continue;
+                  }
+                  if (
+                    czOsmTargetZ < 12 &&
+                    (pl.cls === 'hamlet' || pl.cls === 'quarter')
+                  ) {
+                    continue;
+                  }
+                  const key = pl.name.toLowerCase();
+                  if (seenCzNames.has(key)) continue;
+                  seenCzNames.add(key);
+                  osmExtraPlaces.push(pl);
+                }
+              }
+              osmExtraPlaces.sort((a, b) => a.rank - b.rank);
+              for (const pl of osmExtraPlaces) {
+                const wPt = geoToWorld(pl.lon, pl.lat);
+                const sx = wxToSx(wPt.x);
+                const sy = wyToSy(wPt.y);
+                if (
+                  sx < -25 ||
+                  sx > width + 25 ||
+                  sy < -25 ||
+                  sy > height + 25
+                ) {
+                  continue;
+                }
+                let tooClose = false;
+                for (let i = 0; i < placedCzCities.length; i++) {
+                  const dx = placedCzCities[i].x - sx;
+                  const dy = placedCzCities[i].y - sy;
+                  if (dx * dx + dy * dy < minCzCityDistPx * minCzCityDistPx) {
+                    tooClose = true;
+                    break;
+                  }
+                }
+                if (tooClose) continue;
+                const r = pl.cls === 'town' ? 2.2 : 1.7;
+                ctx.font =
+                  pl.cls === 'suburb' || pl.cls === 'quarter'
+                    ? '500 9px "Plus Jakarta Sans", sans-serif'
+                    : '500 9.2px "Plus Jakarta Sans", sans-serif';
+                const tw = ctx.measureText(pl.name).width;
+                const lx = sx + r + 4.5;
+                const ly = sy;
+                if (
+                  !tryPlaceBox(sx - r - 2, ly - 6.5, r * 2 + 8 + tw, 13, false)
+                ) {
+                  continue;
+                }
+                placedCzCities.push({ x: sx, y: sy });
+                if (pl.cls !== 'suburb' && pl.cls !== 'quarter') {
+                  ctx.beginPath();
+                  ctx.arc(sx, sy, r, 0, Math.PI * 2);
+                  ctx.fillStyle = pal.cityRing;
+                  ctx.fill();
+                  ctx.lineWidth = 1.15;
+                  ctx.strokeStyle = pal.cityDot;
+                  ctx.stroke();
+                }
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'middle';
+                ctx.lineWidth = 2.8;
+                ctx.strokeStyle = pal.textHalo;
+                ctx.strokeText(pl.name, lx, ly);
+                ctx.fillStyle =
+                  pl.cls === 'suburb' || pl.cls === 'quarter'
+                    ? pal.textSecondary
+                    : pal.textPrimary;
+                ctx.fillText(pl.name, lx, ly);
+              }
+            }
           } else {
             const sortedCities = [...CZECH_CITIES].sort(
               (a, b) => b.population - a.population
@@ -3189,6 +3479,85 @@ export const CzechMapCanvas = forwardRef<
               ctx.strokeText(label, lx, ly);
               ctx.fillStyle = pal.peakColor;
               ctx.fillText(label, lx, ly);
+            }
+
+            // Supplement close zoom (z >= 11) with local OSM mountain peaks
+            if (czHasOsm && czOsmTargetZ >= 11) {
+              const seenCzPeaks = new Set(
+                realDataset.places.peaks.map((p) => p.n.toLowerCase())
+              );
+              const osmExtraPeaks: {
+                lon: number;
+                lat: number;
+                name: string;
+                ele: number;
+              }[] = [];
+              for (const tile of czOsmTiles) {
+                for (const pk of tile.peaks) {
+                  if (
+                    pk.lon < czMinLon ||
+                    pk.lon > czMaxLon ||
+                    pk.lat < czMinLat ||
+                    pk.lat > czMaxLat
+                  ) {
+                    continue;
+                  }
+                  const key = pk.name.toLowerCase();
+                  if (seenCzPeaks.has(key)) continue;
+                  seenCzPeaks.add(key);
+                  osmExtraPeaks.push(pk);
+                }
+              }
+              osmExtraPeaks.sort((a, b) => b.ele - a.ele);
+              for (const pk of osmExtraPeaks) {
+                const wPt = geoToWorld(pk.lon, pk.lat);
+                const sx = wxToSx(wPt.x);
+                const sy = wyToSy(wPt.y);
+                if (
+                  sx < -20 ||
+                  sx > width + 20 ||
+                  sy < -20 ||
+                  sy > height + 20
+                ) {
+                  continue;
+                }
+                let tooClose = false;
+                for (let i = 0; i < placedCzPeaks.length; i++) {
+                  const dx = placedCzPeaks[i].x - sx;
+                  const dy = placedCzPeaks[i].y - sy;
+                  if (dx * dx + dy * dy < minCzPeakDistPx * minCzPeakDistPx) {
+                    tooClose = true;
+                    break;
+                  }
+                }
+                if (tooClose) continue;
+                const label = `${pk.name} ${pk.ele}`;
+                ctx.font = 'italic 600 9.2px "Plus Jakarta Sans", sans-serif';
+                const tw = ctx.measureText(label).width;
+                const lx = sx + 6.2;
+                const ly = sy + 1;
+                if (!tryPlaceBox(sx - 5, ly - 6, tw + 13, 12, false)) continue;
+                placedCzPeaks.push({ x: sx, y: sy });
+
+                ctx.beginPath();
+                ctx.moveTo(sx, sy - 4.3);
+                ctx.lineTo(sx + 3.7, sy + 2.9);
+                ctx.lineTo(sx - 3.7, sy + 2.9);
+                ctx.closePath();
+                ctx.fillStyle = pal.peakColor;
+                ctx.strokeStyle = pal.textHalo;
+                ctx.lineWidth = 1.35;
+                ctx.stroke();
+                ctx.fill();
+
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'middle';
+                ctx.lineWidth = 2.6;
+                ctx.strokeStyle = pal.textHalo;
+                ctx.strokeText(label, lx, ly);
+                ctx.fillStyle = pal.peakColor;
+                ctx.fillText(label, lx, ly);
+              }
             }
           } else {
             const sortedPeaks = [...CZECH_PEAKS].sort(
@@ -3401,6 +3770,7 @@ export const CzechMapCanvas = forwardRef<
       worldDataset,
       worldPlacesIndex,
       blockRevision,
+      osmRevision,
       borderWorld,
       layers,
       terrain.contours,
@@ -4090,9 +4460,20 @@ export const CzechMapCanvas = forwardRef<
   const scaleRatio = Math.round(3780 / camera.zoom);
 
   const activeBlockBadge = useMemo(() => {
-    if (mapScope !== 'world') return null;
+    if (mapScope === 'cz') {
+      const tl = worldToGeo(
+        camera.cx - (viewportSize.width * 0.56) / camera.zoom,
+        camera.cy - (viewportSize.height * 0.56) / camera.zoom
+      );
+      const br = worldToGeo(
+        camera.cx + (viewportSize.width * 0.56) / camera.zoom,
+        camera.cy + (viewportSize.height * 0.56) / camera.zoom
+      );
+      const z = pickOsmVectorZoom(Math.abs(br.lon - tl.lon), 7, 14);
+      return `· Detailní podklad OSM z${z}`;
+    }
     if (camera.zoom < DETAIL_WORLD_ZOOM) {
-      return '· Detailní bloky od 1 : 3 000 000';
+      return '· Detailní podklad OSM od 1 : 3 000 000';
     }
     const tl = globalWorldToGeo(
       camera.cx - (viewportSize.width * 0.56) / camera.zoom,
@@ -4102,13 +4483,18 @@ export const CzechMapCanvas = forwardRef<
       camera.cx + (viewportSize.width * 0.56) / camera.zoom,
       camera.cy + (viewportSize.height * 0.56) / camera.zoom
     );
+    const minLon = Math.min(tl.lon, br.lon);
+    const maxLon = Math.max(tl.lon, br.lon);
+    const minLat = Math.min(tl.lat, br.lat);
+    const maxLat = Math.max(tl.lat, br.lat);
+    const z = pickOsmVectorZoom(maxLon - minLon, 7, 14);
     const { loadedBlocks, activeMetas, loadingCount } =
       ensureWorldDetailBlocksForViewport(
         worldPlacesIndex,
-        Math.min(tl.lon, br.lon),
-        Math.max(tl.lon, br.lon),
-        Math.min(tl.lat, br.lat),
-        Math.max(tl.lat, br.lat),
+        minLon,
+        maxLon,
+        minLat,
+        maxLat,
         () => setBlockRevision((v) => v + 1),
         1.8
       );
@@ -4117,8 +4503,8 @@ export const CzechMapCanvas = forwardRef<
       return `· Načítání bloku ${primaryCode} (${loadedBlocks.length}/${activeMetas.length})`;
     }
     return `· Blok ${primaryCode}${
-      activeMetas.length > 1 ? ` +${activeMetas.length - 1} okolí` : ''
-    } (10m detail)`;
+      activeMetas.length > 1 ? ` +${activeMetas.length - 1}` : ''
+    } · OSM z${z}`;
   }, [
     mapScope,
     camera.cx,
@@ -4128,6 +4514,7 @@ export const CzechMapCanvas = forwardRef<
     viewportSize.height,
     worldPlacesIndex,
     blockRevision,
+    osmRevision,
   ]);
 
   return (
