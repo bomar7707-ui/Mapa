@@ -1,0 +1,6 @@
+{
+  "name": "Turistický mapový podklad",
+  "description": "Vlastní topografický mapový podklad s vrstevnicemi, stínovaným reliéfem, sítí turistických tras KČT, výškovým profilem a plánovačem tras.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
