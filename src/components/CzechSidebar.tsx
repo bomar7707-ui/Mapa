@@ -92,6 +92,11 @@ const STYLE_PRESETS: { id: MapStylePreset; label: string; desc: string }[] = [
     label: 'Tmavý reliéf',
     desc: 'Kontrastní tmavý podklad se zvýrazněným vodstvem',
   },
+  {
+    id: 'satellite',
+    label: 'Satelitní (Sentinel-2)',
+    desc: 'Bezoblačné satelitní snímky ESA Sentinel-2 (CC BY 4.0) s hybridními popisky',
+  },
 ];
 
 const QUICK_PLACES_CZ: {
@@ -960,8 +965,8 @@ export const CzechSidebar: React.FC<CzechSidebarProps> = ({
       <div className="px-4 py-3 border-t border-[#1C2420]/10 bg-[#FAF9F5] text-[11px] text-[#5B6760] flex items-center justify-between">
         <span>
           {mapScope === 'world'
-            ? 'Verze 1.2 · Globální WGS84 · SRTM/ETOPO'
-            : 'Verze 1.2 · Projekce WGS84 · ČR'}
+            ? 'Verze 1.3 · Globální WGS84 · SRTM/ETOPO'
+            : 'Verze 1.3 · Projekce WGS84 · ČR'}
         </span>
         <span className="font-mono-tabular">
           {mapScope === 'world' ? '−9 337–8 849 m' : '115–1 603 m'}

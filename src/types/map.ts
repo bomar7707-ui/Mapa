@@ -1,4 +1,4 @@
-export type MapStylePreset = 'atlas' | 'natural' | 'light' | 'dark';
+export type MapStylePreset = 'atlas' | 'natural' | 'light' | 'dark' | 'satellite';
 
 export interface GeoPoint {
   lon: number;

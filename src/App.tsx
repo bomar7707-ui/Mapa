@@ -296,7 +296,7 @@ export default function App() {
               : 'Mapový podklad ČR'}
           </span>
           <span className="px-1.5 py-0.5 text-[11px] font-mono-tabular font-semibold text-[#1E5631] bg-[#E8F2EC] border border-[#1E5631]/20 rounded">
-            v1.2
+            v1.3
           </span>
         </div>
 
@@ -307,6 +307,7 @@ export default function App() {
               { id: 'natural', label: 'Přírodní terén' },
               { id: 'light', label: 'Světlý podklad' },
               { id: 'dark', label: 'Tmavý reliéf' },
+              { id: 'satellite', label: 'Satelitní (Sentinel-2)' },
             ] as const
           ).map((item) => (
             <button

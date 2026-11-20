@@ -244,7 +244,7 @@ export function buildOsmRenderOptions(
 }
 
 function getRenderSignature(opts: OsmTileRenderOptions): string {
-  return `v6|${opts.stylePreset}|${opts.forests ? 1 : 0}${opts.hydrology ? 1 : 0}${opts.highways ? 1 : 0}${opts.railways ? 1 : 0}${opts.cities ? 1 : 0}${opts.drawCountryBorders ? 1 : 0}${opts.drawRegionalBorders ? 1 : 0}`;
+  return `v7|${opts.stylePreset}|${opts.forests ? 1 : 0}${opts.hydrology ? 1 : 0}${opts.highways ? 1 : 0}${opts.railways ? 1 : 0}${opts.cities ? 1 : 0}${opts.drawCountryBorders ? 1 : 0}${opts.drawRegionalBorders ? 1 : 0}`;
 }
 
 function getPreferredName(props: Record<string, unknown>): string | undefined {
@@ -985,9 +985,11 @@ function rasterizeOsmTile(
   // ---------------------------------------------------------------------------
   // LAYER A (baseImageData): Forests, wetlands, glaciers, parks, urban, buildings
   // Composited with 'multiply' in light/atlas/natural themes so 100% of 3D hillshade shines through forests!
+  // Skipped in 'satellite' mode so real Sentinel-2 satellite imagery remains fully visible.
   // ---------------------------------------------------------------------------
+  const isSatellite = opts.stylePreset === 'satellite';
   let baseImageData: ImageData | null = null;
-  if (ctx && (opts.forests || opts.cities)) {
+  if (ctx && !isSatellite && (opts.forests || opts.cities)) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
     ctx.setLineDash([]);
@@ -1220,8 +1222,8 @@ function rasterizeOsmTile(
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
-      // 1a. Ocean & Sea polygons (always rendered from OSM coastlines so low-lying land below sea level is never flooded by DEM)
-      if (waterLayer) {
+      // 1a. Ocean & Sea polygons (always rendered from OSM coastlines except in satellite mode where real imagery shows the sea)
+      if (!isSatellite && waterLayer) {
         const ext = waterLayer.extent || 4096;
         const oceanFill =
           opts.stylePreset === 'dark'
@@ -1258,7 +1260,7 @@ function rasterizeOsmTile(
 
       // 1b. Hydrology: Inland water polygons (lakes, lagoons, rivers, ponds) & clean single-stroke waterways
       if (opts.hydrology) {
-        if (waterLayer) {
+        if (!isSatellite && waterLayer) {
           const ext = waterLayer.extent || 4096;
           const minWaterPx = z <= 8 ? 0.65 : 0.45;
           ctx.fillStyle = opts.waterFill;

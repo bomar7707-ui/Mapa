@@ -51,6 +51,10 @@ import {
   renderOsmWaterLabels,
 } from '../engine/osmCanvasRenderer';
 import {
+  ensureSatelliteTilesForViewport,
+  renderSatelliteTilesToCanvas,
+} from '../engine/satelliteTiles';
+import {
   CompiledWorldTerrain,
   GLOBAL_HEIGHT,
   GLOBAL_WIDTH,
@@ -314,6 +318,34 @@ const PALETTES: Record<MapStylePreset, PaletteConfig> = {
     cityDot: '#9A6B3E',
     cityRing: '#E09248',
     peakColor: '#E2E8F0',
+    isDark: true,
+  },
+  satellite: {
+    bg: '#0C1726',
+    outsideVeil: 'rgba(10, 18, 28, 0.42)',
+    hillshadeStrength: 0.22,
+    forestColor: [46, 86, 58],
+    forestOpacity: 0.0,
+    contourMinor: 'rgba(255, 244, 214, 0.22)',
+    contourIndex: 'rgba(255, 236, 188, 0.44)',
+    contourHalo: 'rgba(10, 16, 26, 0.78)',
+    waterFill: 'rgba(56, 146, 212, 0.36)',
+    waterStroke: 'rgba(126, 206, 255, 0.65)',
+    borderOuter: 'rgba(0, 0, 0, 0.56)',
+    borderInner: 'rgba(255, 246, 206, 0.90)',
+    regionBorder: 'rgba(255, 255, 255, 0.42)',
+    highwayCasing: 'rgba(22, 68, 30, 0.90)',
+    highwayCore: '#58C464',
+    highwayBadgeBg: '#2F8A3A',
+    highwayBadgeText: '#FFFFFF',
+    gridStroke: 'rgba(255, 255, 255, 0.16)',
+    gridText: 'rgba(241, 245, 249, 0.78)',
+    textPrimary: '#FFFFFF',
+    textSecondary: '#E2E8F0',
+    textHalo: 'rgba(10, 16, 26, 0.92)',
+    cityDot: '#B45309',
+    cityRing: '#FBBF24',
+    peakColor: '#F8FAFC',
     isDark: true,
   },
 };
@@ -593,7 +625,7 @@ function rasterizeTerrainGrid(
 
       let rgb: [number, number, number];
       if (isWorld) {
-        if (stylePreset === 'dark') {
+        if (stylePreset === 'dark' || stylePreset === 'satellite') {
           if (isOcean) {
             const t = Math.max(0, Math.min(1, (elev + 7000) / 7000));
             rgb = layers.hypsometry
@@ -646,7 +678,7 @@ function rasterizeTerrainGrid(
               ? [166, 213, 247]
               : [246, 244, 236];
         }
-      } else if (stylePreset === 'dark') {
+      } else if (stylePreset === 'dark' || stylePreset === 'satellite') {
         rgb = layers.hypsometry
           ? evaluateSmoothColorStops(elev, CZ_DARK_STOPS)
           : [34, 44, 52];
@@ -1396,9 +1428,11 @@ export const CzechMapCanvas = forwardRef<
   const [tileRevision, setTileRevision] = useState(0);
   const [blockRevision, setBlockRevision] = useState(0);
   const [osmRevision, setOsmRevision] = useState(0);
+  const [satRevision, setSatRevision] = useState(0);
 
   const osmTimerRef = useRef<number | null>(null);
   const blockTimerRef = useRef<number | null>(null);
+  const satTimerRef = useRef<number | null>(null);
 
   const scheduleOsmRedraw = useCallback(() => {
     if (osmTimerRef.current !== null) return;
@@ -1416,11 +1450,20 @@ export const CzechMapCanvas = forwardRef<
     }, 65);
   }, []);
 
+  const scheduleSatRedraw = useCallback(() => {
+    if (satTimerRef.current !== null) return;
+    satTimerRef.current = window.setTimeout(() => {
+      satTimerRef.current = null;
+      setSatRevision((v) => v + 1);
+    }, 65);
+  }, []);
+
   useEffect(() => {
     return () => {
       if (osmTimerRef.current !== null) window.clearTimeout(osmTimerRef.current);
       if (blockTimerRef.current !== null)
         window.clearTimeout(blockTimerRef.current);
+      if (satTimerRef.current !== null) window.clearTimeout(satTimerRef.current);
     };
   }, []);
 
@@ -1632,6 +1675,7 @@ export const CzechMapCanvas = forwardRef<
       forExport = false
     ) => {
       const pal = PALETTES[stylePreset];
+      const isSatellite = stylePreset === 'satellite';
       ctx.save();
       ctx.fillStyle = pal.bg;
       ctx.fillRect(0, 0, width, height);
@@ -1644,29 +1688,13 @@ export const CzechMapCanvas = forwardRef<
       const sheetW = activeWidth * cam.zoom;
       const sheetH = activeHeight * cam.zoom;
 
-      // 1. Draw Base Terrain Raster + Local High-Res Refinement Patch (viewport-cropped for Skia safety)
+      // 1. Draw Base Terrain Raster + Local High-Res Refinement Patch OR Sentinel-2 Cloudless Satellite Tiles
       ctx.save();
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
 
-      const patchThreshold = mapScope === 'world' ? 0.00011 : 0.0036;
-      const hasActivePatch = Boolean(
-        localPatch &&
-          localPatch.scope === mapScope &&
-          !forExport &&
-          cam.zoom >= patchThreshold
-      );
-      let patchCoversViewport = false;
-      if (hasActivePatch && localPatch) {
-        const px0 = wxToSx(localPatch.patch.x0);
-        const py0 = wyToSy(localPatch.patch.y0);
-        const pw = localPatch.patch.width * cam.zoom;
-        const ph = localPatch.patch.height * cam.zoom;
-        patchCoversViewport =
-          px0 <= 0 && py0 <= 0 && px0 + pw >= width && py0 + ph >= height;
-      }
-
-      if (!patchCoversViewport) {
+      if (isSatellite) {
+        // Dark base fallback while Sentinel-2 tiles stream in
         drawCroppedImage(
           ctx,
           activeTerrainRaster,
@@ -1677,20 +1705,89 @@ export const CzechMapCanvas = forwardRef<
           width,
           height
         );
-      }
 
-      if (hasActivePatch && localPatch) {
-        const { patch, raster } = localPatch;
-        drawCroppedImage(
-          ctx,
-          raster,
-          wxToSx(patch.x0),
-          wyToSy(patch.y0),
-          patch.width * cam.zoom,
-          patch.height * cam.zoom,
-          width,
-          height
+        const satTl = unprojectWorld(
+          cam.cx - (width * 0.51) / cam.zoom,
+          cam.cy - (height * 0.51) / cam.zoom
         );
+        const satBr = unprojectWorld(
+          cam.cx + (width * 0.51) / cam.zoom,
+          cam.cy + (height * 0.51) / cam.zoom
+        );
+        const satMinLon = Math.min(satTl.lon, satBr.lon);
+        const satMaxLon = Math.max(satTl.lon, satBr.lon);
+        const satMinLat = Math.min(satTl.lat, satBr.lat);
+        const satMaxLat = Math.max(satTl.lat, satBr.lat);
+
+        const { tiles: satTiles } = ensureSatelliteTilesForViewport(
+          satMinLon,
+          satMaxLon,
+          satMinLat,
+          satMaxLat,
+          width,
+          scheduleSatRedraw
+        );
+
+        ctx.save();
+        if (mapScope === 'world') {
+          ctx.beginPath();
+          ctx.rect(sheetX, sheetY, sheetW, sheetH);
+          ctx.clip();
+        }
+        renderSatelliteTilesToCanvas(
+          ctx,
+          satTiles,
+          width,
+          height,
+          projectGeo,
+          wxToSx,
+          wyToSy
+        );
+        ctx.restore();
+      } else {
+        const patchThreshold = mapScope === 'world' ? 0.00011 : 0.0036;
+        const hasActivePatch = Boolean(
+          localPatch &&
+            localPatch.scope === mapScope &&
+            !forExport &&
+            cam.zoom >= patchThreshold
+        );
+        let patchCoversViewport = false;
+        if (hasActivePatch && localPatch) {
+          const px0 = wxToSx(localPatch.patch.x0);
+          const py0 = wyToSy(localPatch.patch.y0);
+          const pw = localPatch.patch.width * cam.zoom;
+          const ph = localPatch.patch.height * cam.zoom;
+          patchCoversViewport =
+            px0 <= 0 && py0 <= 0 && px0 + pw >= width && py0 + ph >= height;
+        }
+
+        if (!patchCoversViewport) {
+          drawCroppedImage(
+            ctx,
+            activeTerrainRaster,
+            sheetX,
+            sheetY,
+            sheetW,
+            sheetH,
+            width,
+            height
+          );
+        }
+
+        if (hasActivePatch && localPatch) {
+          const { patch, raster } = localPatch;
+          drawCroppedImage(
+            ctx,
+            raster,
+            wxToSx(patch.x0),
+            wyToSy(patch.y0),
+            patch.width * cam.zoom,
+            patch.height * cam.zoom,
+            width,
+            height
+          );
+        }
       }
 
       // Collision boxes for legible cartographic labels
@@ -2241,8 +2338,8 @@ export const CzechMapCanvas = forwardRef<
           renderOsmOverlayBitmaps(worldOsmTiles, worldOsmRc);
         }
 
-        // 6W. Global Hydrology fallback (50m overview or block vectors while OSM tiles load)
-        if (layers.hydrology && (!isDetailScale || !worldHasOsm)) {
+        // 6W. Global Hydrology fallback (50m overview or block vectors while OSM tiles load; skipped in satellite mode so real water shines through)
+        if (layers.hydrology && !isSatellite && (!isDetailScale || !worldHasOsm)) {
           if (isDetailScale && loadedBlocks.length > 0) {
             for (const blk of loadedBlocks) {
               for (const lake of blk.lakes) {
@@ -4636,6 +4733,7 @@ export const CzechMapCanvas = forwardRef<
       activeWidth,
       activeHeight,
       projectGeo,
+      unprojectWorld,
       stylePreset,
       activeTerrainRaster,
       localPatch,
@@ -4644,8 +4742,10 @@ export const CzechMapCanvas = forwardRef<
       worldPlacesIndex,
       blockRevision,
       osmRevision,
+      satRevision,
       scheduleOsmRedraw,
       scheduleBlockRedraw,
+      scheduleSatRedraw,
       borderWorld,
       layers,
       terrain.contours,
@@ -4777,9 +4877,11 @@ export const CzechMapCanvas = forwardRef<
         ctx.fillStyle = '#545E58';
         ctx.font = '500 15px "Plus Jakarta Sans", sans-serif';
         ctx.fillText(
-          mapScope === 'world'
-            ? 'Globální reliéf a batymetrie oceánů · 240 států · Vodní síť · Světové metropole a velehorstva · WGS84'
-            : 'Reliéfní hypsometrie · Stínovaný terén · Vodní síť · Silniční tahy · Vrstevnice 10–200 m · WGS84',
+          stylePreset === 'satellite'
+            ? 'Satelitní snímky: Sentinel-2 cloudless by EOX (CC BY 4.0 · ESA Copernicus) · © OpenStreetMap contributors · WGS84'
+            : mapScope === 'world'
+              ? 'Globální reliéf a batymetrie · © OpenStreetMap contributors · OpenFreeMap · SRTM / ETOPO · WGS84'
+              : 'Reliéfní hypsometrie · © OpenStreetMap contributors · OpenFreeMap · SRTM / EU-DEM · WGS84',
           38,
           mapH + 72
         );
@@ -5576,6 +5678,42 @@ export const CzechMapCanvas = forwardRef<
               </span>
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Bottom-right Data Attribution (ODbL / CC BY 4.0) */}
+      <div className="absolute bottom-3 right-3 z-10">
+        <div className="bg-white/90 backdrop-blur-sm border border-[#1C2420]/12 rounded-md px-2.5 py-1 shadow-sm text-[10px] text-[#4A5A50] flex items-center gap-1.5">
+          {stylePreset === 'satellite' && (
+            <>
+              <a
+                href="https://s2maps.eu"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="hover:text-[#1C2420] underline decoration-[#1C2420]/25"
+              >
+                Sentinel-2 cloudless by EOX (CC BY 4.0)
+              </a>
+              <span aria-hidden="true">·</span>
+            </>
+          )}
+          <a
+            href="https://www.openstreetmap.org/copyright"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-[#1C2420] underline decoration-[#1C2420]/25"
+          >
+            © OpenStreetMap
+          </a>
+          <span aria-hidden="true">·</span>
+          <a
+            href="https://openfreemap.org"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-[#1C2420] underline decoration-[#1C2420]/25"
+          >
+            OpenFreeMap
+          </a>
         </div>
       </div>
     </div>
