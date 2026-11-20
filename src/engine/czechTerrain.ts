@@ -17,8 +17,8 @@ import {
 export const WORLD_WIDTH = 531690;
 export const WORLD_HEIGHT = 322540;
 
-export const DEM_COLS = 560;
-export const DEM_ROWS = 340;
+export const DEM_COLS = 420;
+export const DEM_ROWS = 255;
 export const CELL_SIZE_X = WORLD_WIDTH / (DEM_COLS - 1);
 export const CELL_SIZE_Y = WORLD_HEIGHT / (DEM_ROWS - 1);
 
@@ -238,6 +238,23 @@ export function compileCzechTerrain(
   const elevationGrid = new Float32Array(count);
   const forestGrid = new Float32Array(count);
 
+  // Lightweight instant placeholder before real cz-dem.png finishes loading (~100ms)
+  // Avoids a 2-second synchronous main-thread stall on initial app mount.
+  if (!realDem) {
+    elevationGrid.fill(380);
+    const hillshadeGrid = new Float32Array(count);
+    hillshadeGrid.fill(0.67);
+    return {
+      elevationGrid,
+      hillshadeGrid,
+      forestGrid,
+      contours: [],
+      minElevation: 115,
+      maxElevation: 1603,
+      isRealDem: false,
+    };
+  }
+
   let minElevation = Infinity;
   let maxElevation = -Infinity;
 
@@ -254,45 +271,10 @@ export function compileCzechTerrain(
         (x / WORLD_WIDTH) * (CZ_BOUNDS.maxLon - CZ_BOUNDS.minLon);
 
       const idx = r * DEM_COLS + c;
-      const e = realDem
-        ? sampleRealDemBilinear(realDem, lon, lat)
-        : evaluateCzechElevation(lon, lat);
+      const e = sampleRealDemBilinear(realDem, lon, lat);
       elevationGrid[idx] = e;
       if (e < minElevation) minElevation = e;
       if (e > maxElevation) maxElevation = e;
-    }
-  }
-
-  // Estimate slope proxy for realistic forest distribution along steep valleys & slopes
-  for (let r = 0; r < DEM_ROWS; r++) {
-    const lat =
-      CZ_BOUNDS.maxLat -
-      ((r * CELL_SIZE_Y) / WORLD_HEIGHT) * (CZ_BOUNDS.maxLat - CZ_BOUNDS.minLat);
-    const rPrev = Math.max(0, r - 1);
-    const rNext = Math.min(DEM_ROWS - 1, r + 1);
-    for (let c = 0; c < DEM_COLS; c++) {
-      const lon =
-        CZ_BOUNDS.minLon +
-        ((c * CELL_SIZE_X) / WORLD_WIDTH) *
-          (CZ_BOUNDS.maxLon - CZ_BOUNDS.minLon);
-      const cPrev = Math.max(0, c - 1);
-      const cNext = Math.min(DEM_COLS - 1, c + 1);
-      const idx = r * DEM_COLS + c;
-      const dzx =
-        (elevationGrid[r * DEM_COLS + cNext] -
-          elevationGrid[r * DEM_COLS + cPrev]) /
-        ((cNext - cPrev) * CELL_SIZE_X);
-      const dzy =
-        (elevationGrid[rNext * DEM_COLS + c] -
-          elevationGrid[rPrev * DEM_COLS + c]) /
-        ((rNext - rPrev) * CELL_SIZE_Y);
-      const slopeProxy = Math.hypot(dzx, dzy);
-      forestGrid[idx] = evaluateForestCover(
-        lon,
-        lat,
-        elevationGrid[idx],
-        slopeProxy
-      );
     }
   }
 
@@ -302,7 +284,7 @@ export function compileCzechTerrain(
     DEM_ROWS,
     CELL_SIZE_X,
     CELL_SIZE_Y,
-    realDem ? 8.5 : 13.5
+    8.5
   );
 
   const contours = extractContours(
@@ -322,7 +304,7 @@ export function compileCzechTerrain(
     contours,
     minElevation,
     maxElevation,
-    isRealDem: Boolean(realDem),
+    isRealDem: true,
   };
 }
 
@@ -340,8 +322,8 @@ export function compileLocalViewportTerrain(
   realDem?: RealDemGrid | null,
   preferredTileZ?: number
 ): LocalTerrainPatch {
-  const cols = 300;
-  const rows = 194;
+  const cols = 220;
+  const rows = 142;
   const count = cols * rows;
   const elevationGrid = new Float32Array(count);
   const forestGrid = new Float32Array(count);
@@ -368,33 +350,36 @@ export function compileLocalViewportTerrain(
     }
   }
 
-  for (let r = 0; r < rows; r++) {
-    const wy = y0 + r * dy;
-    const lat =
-      CZ_BOUNDS.maxLat -
-      (wy / WORLD_HEIGHT) * (CZ_BOUNDS.maxLat - CZ_BOUNDS.minLat);
-    const rPrev = Math.max(0, r - 1);
-    const rNext = Math.min(rows - 1, r + 1);
-    for (let c = 0; c < cols; c++) {
-      const wx = x0 + c * dx;
-      const lon =
-        CZ_BOUNDS.minLon +
-        (wx / WORLD_WIDTH) * (CZ_BOUNDS.maxLon - CZ_BOUNDS.minLon);
-      const cPrev = Math.max(0, c - 1);
-      const cNext = Math.min(cols - 1, c + 1);
-      const idx = r * cols + c;
-      const dzx =
-        (elevationGrid[r * cols + cNext] - elevationGrid[r * cols + cPrev]) /
-        ((cNext - cPrev) * dx);
-      const dzy =
-        (elevationGrid[rNext * cols + c] - elevationGrid[rPrev * cols + c]) /
-        ((rNext - rPrev) * dy);
-      forestGrid[idx] = evaluateForestCover(
-        lon,
-        lat,
-        elevationGrid[idx],
-        Math.hypot(dzx, dzy)
-      );
+  // Skip synthetic forestGrid pass for Czech local patches (real forests come from OSM bitmaps)
+  if (!realDem) {
+    for (let r = 0; r < rows; r++) {
+      const wy = y0 + r * dy;
+      const lat =
+        CZ_BOUNDS.maxLat -
+        (wy / WORLD_HEIGHT) * (CZ_BOUNDS.maxLat - CZ_BOUNDS.minLat);
+      const rPrev = Math.max(0, r - 1);
+      const rNext = Math.min(rows - 1, r + 1);
+      for (let c = 0; c < cols; c++) {
+        const wx = x0 + c * dx;
+        const lon =
+          CZ_BOUNDS.minLon +
+          (wx / WORLD_WIDTH) * (CZ_BOUNDS.maxLon - CZ_BOUNDS.minLon);
+        const cPrev = Math.max(0, c - 1);
+        const cNext = Math.min(cols - 1, c + 1);
+        const idx = r * cols + c;
+        const dzx =
+          (elevationGrid[r * cols + cNext] - elevationGrid[r * cols + cPrev]) /
+          ((cNext - cPrev) * dx);
+        const dzy =
+          (elevationGrid[rNext * cols + c] - elevationGrid[rPrev * cols + c]) /
+          ((rNext - rPrev) * dy);
+        forestGrid[idx] = evaluateForestCover(
+          lon,
+          lat,
+          elevationGrid[idx],
+          Math.hypot(dzx, dzy)
+        );
+      }
     }
   }
 
@@ -418,8 +403,10 @@ export function compileLocalViewportTerrain(
     zFactor
   );
 
-  const minorInterval = zoom >= 0.032 ? 20 : zoom >= 0.012 ? 25 : 50;
-  const majorInterval = zoom >= 0.032 ? 100 : zoom >= 0.012 ? 100 : 200;
+  const minorInterval =
+    zoom >= 0.06 ? 10 : zoom >= 0.028 ? 20 : zoom >= 0.012 ? 25 : 50;
+  const majorInterval =
+    zoom >= 0.06 ? 50 : zoom >= 0.028 ? 100 : zoom >= 0.012 ? 100 : 200;
 
   let contours: ContourLevel[] = [];
   if (withContours) {

@@ -23,18 +23,31 @@ export function extractContours(
   let minE = Infinity;
   let maxE = -Infinity;
   for (let i = 0; i < grid.length; i++) {
-    if (grid[i] < minE) minE = grid[i];
-    if (grid[i] > maxE) maxE = grid[i];
+    const v = grid[i];
+    if (!Number.isFinite(v) || v < -12000 || v > 9500) continue;
+    if (v < minE) minE = v;
+    if (v > maxE) maxE = v;
+  }
+  if (!Number.isFinite(minE) || !Number.isFinite(maxE) || maxE <= minE) {
+    return [];
   }
 
-  const startLevel = Math.ceil(minE / interval) * interval;
-  const endLevel = Math.floor(maxE / interval) * interval;
-  const levels: ContourLevel[] = [];
+  // Ensure at most 55 contour levels even on extreme mountain relief (e.g. Himalaya 0..8849 m)
+  let effInterval = Math.max(5, interval);
+  while ((maxE - minE) / effInterval > 55) {
+    effInterval *= 2;
+  }
+  const effIndexInterval = Math.max(effInterval, indexInterval);
 
-  for (let level = startLevel; level <= endLevel; level += interval) {
+  const startLevel = Math.ceil(minE / effInterval) * effInterval;
+  const endLevel = Math.floor(maxE / effInterval) * effInterval;
+  const levels: ContourLevel[] = [];
+  const maxSegmentsPerLevel = 9000;
+
+  for (let level = startLevel; level <= endLevel; level += effInterval) {
     const segments: ContourSegment[] = [];
 
-    for (let r = 0; r < rows - 1; r++) {
+    for (let r = 0; r < rows - 1 && segments.length < maxSegmentsPerLevel; r++) {
       const y0 = r * cellSizeY;
       const y1 = (r + 1) * cellSizeY;
       const rowOffset = r * cols;
@@ -127,7 +140,7 @@ export function extractContours(
     if (segments.length > 0) {
       levels.push({
         elevation: level,
-        isIndex: level % indexInterval === 0,
+        isIndex: level % effIndexInterval === 0,
         polylines: chainSegments(segments),
       });
     }
@@ -148,10 +161,18 @@ function chainSegments(segments: ContourSegment[]): Point2D[][] {
     const s = segments[i];
     const k1 = keyOf(s.x1, s.y1);
     const k2 = keyOf(s.x2, s.y2);
-    if (!adj.has(k1)) adj.set(k1, []);
-    if (!adj.has(k2)) adj.set(k2, []);
-    adj.get(k1)!.push(i);
-    adj.get(k2)!.push(i);
+    let a1 = adj.get(k1);
+    if (!a1) {
+      a1 = [];
+      adj.set(k1, a1);
+    }
+    a1.push(i);
+    let a2 = adj.get(k2);
+    if (!a2) {
+      a2 = [];
+      adj.set(k2, a2);
+    }
+    a2.push(i);
   }
 
   const polylines: Point2D[][] = [];
@@ -160,57 +181,68 @@ function chainSegments(segments: ContourSegment[]): Point2D[][] {
     if (used[i]) continue;
     used[i] = 1;
     const s = segments[i];
-    const line: Point2D[] = [
+    const forward: Point2D[] = [
       { x: s.x1, y: s.y1 },
       { x: s.x2, y: s.y2 },
     ];
 
-    // Extend forward
+    // Extend forward in O(1)
     let extended = true;
     while (extended) {
       extended = false;
-      const tail = line[line.length - 1];
-      const candidates = adj.get(keyOf(tail.x, tail.y));
+      const tail = forward[forward.length - 1];
+      const kTail = keyOf(tail.x, tail.y);
+      const candidates = adj.get(kTail);
       if (!candidates) break;
-      for (const idx of candidates) {
+      for (let c = 0; c < candidates.length; c++) {
+        const idx = candidates[c];
         if (used[idx]) continue;
         used[idx] = 1;
         const seg = segments[idx];
-        const kTail = keyOf(tail.x, tail.y);
         if (keyOf(seg.x1, seg.y1) === kTail) {
-          line.push({ x: seg.x2, y: seg.y2 });
+          forward.push({ x: seg.x2, y: seg.y2 });
         } else {
-          line.push({ x: seg.x1, y: seg.y1 });
+          forward.push({ x: seg.x1, y: seg.y1 });
         }
         extended = true;
         break;
       }
     }
 
-    // Extend backward
+    // Extend backward in O(1) via separate array + reverse
+    const backward: Point2D[] = [];
+    let head = forward[0];
     extended = true;
     while (extended) {
       extended = false;
-      const head = line[0];
-      const candidates = adj.get(keyOf(head.x, head.y));
+      const kHead = keyOf(head.x, head.y);
+      const candidates = adj.get(kHead);
       if (!candidates) break;
-      for (const idx of candidates) {
+      for (let c = 0; c < candidates.length; c++) {
+        const idx = candidates[c];
         if (used[idx]) continue;
         used[idx] = 1;
         const seg = segments[idx];
-        const kHead = keyOf(head.x, head.y);
-        if (keyOf(seg.x1, seg.y1) === kHead) {
-          line.unshift({ x: seg.x2, y: seg.y2 });
-        } else {
-          line.unshift({ x: seg.x1, y: seg.y1 });
-        }
+        const nextPt =
+          keyOf(seg.x1, seg.y1) === kHead
+            ? { x: seg.x2, y: seg.y2 }
+            : { x: seg.x1, y: seg.y1 };
+        backward.push(nextPt);
+        head = nextPt;
         extended = true;
         break;
       }
     }
 
-    if (line.length >= 3) {
-      polylines.push(line);
+    const totalLen = backward.length + forward.length;
+    if (totalLen >= 3) {
+      if (backward.length > 0) {
+        backward.reverse();
+        for (let k = 0; k < forward.length; k++) backward.push(forward[k]);
+        polylines.push(backward);
+      } else {
+        polylines.push(forward);
+      }
     }
   }
 

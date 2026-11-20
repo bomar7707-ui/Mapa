@@ -15,7 +15,6 @@ import {
   CZECH_HIGHWAYS,
   CZECH_LAKES,
   CZECH_PEAKS,
-  CZECH_REGION_LINES,
   CZECH_RIVERS,
   CZECH_URBAN_AREAS,
 } from '../data/czechGeo';
@@ -36,19 +35,20 @@ import {
   WORLD_GEO_BOUNDS,
   ensureViewportTerrariumTiles,
   ensureWorldDetailBlocksForViewport,
+  getIntersectingWorldBlocks,
   pickTerrariumZoom,
   pickWorldTerrariumZoom,
 } from '../engine/realCzechData';
 import {
+  buildOsmRenderOptions,
   ensureOsmVectorTilesForViewport,
-  pickOsmVectorZoom,
 } from '../engine/osmVectorTiles';
 import {
   OsmRenderContext,
-  renderOsmBorders,
-  renderOsmHydrology,
-  renderOsmLandcoverAndUrban,
-  renderOsmTransport,
+  renderOsmBaseBitmaps,
+  renderOsmOverlayBitmaps,
+  renderOsmTransportLabels,
+  renderOsmWaterLabels,
 } from '../engine/osmCanvasRenderer';
 import {
   CompiledWorldTerrain,
@@ -76,6 +76,71 @@ import {
 
 // Scale 1 : 3,000,000 corresponds to camera.zoom = 3780 / 3,000,000 = 0.00126
 const DETAIL_WORLD_ZOOM = 0.00125;
+
+interface FixedZoomLevel {
+  level: number;
+  zoom: number;
+  label: string;
+  osmZ: number | null; // null = global overview (no OSM tiles needed)
+}
+
+const WORLD_FIXED_LEVELS_BASE: Omit<FixedZoomLevel, 'level'>[] = [
+  { zoom: 0.000028, label: 'Celý svět', osmZ: null },
+  { zoom: 0.000055, label: 'Kontinenty', osmZ: null },
+  { zoom: 0.00011, label: 'Velké oblasti', osmZ: null },
+  { zoom: 0.00024, label: 'Státy', osmZ: null },
+  { zoom: 0.00055, label: 'Části kontinentů', osmZ: null },
+  { zoom: 0.00145, label: 'Regiony · Detail', osmZ: 7 },
+  { zoom: 0.0029, label: 'Kraje a pohoří', osmZ: 8 },
+  { zoom: 0.0058, label: 'Okresy', osmZ: 9 },
+  { zoom: 0.0116, label: 'Silniční síť', osmZ: 10 },
+  { zoom: 0.0235, label: 'Města a obce', osmZ: 11 },
+  { zoom: 0.047, label: 'Turistický detail', osmZ: 12 },
+  { zoom: 0.094, label: 'Ulice a toky', osmZ: 13 },
+  { zoom: 0.188, label: 'Budovy a ulice', osmZ: 14 },
+];
+
+const CZ_FIXED_LEVELS_BASE: Omit<FixedZoomLevel, 'level'>[] = [
+  { zoom: 0.0022, label: 'Celá ČR', osmZ: 8 },
+  { zoom: 0.0046, label: 'Čechy / Morava', osmZ: 8 },
+  { zoom: 0.0092, label: 'Kraje', osmZ: 9 },
+  { zoom: 0.0185, label: 'Okresy a pohoří', osmZ: 10 },
+  { zoom: 0.037, label: 'Města a silnice', osmZ: 11 },
+  { zoom: 0.074, label: 'Obce a toky', osmZ: 12 },
+  { zoom: 0.148, label: 'Turistický detail', osmZ: 13 },
+  { zoom: 0.296, label: 'Ulice a budovy', osmZ: 14 },
+];
+
+function buildFixedZoomLevels(
+  scope: MapScope,
+  fitZoom: number
+): FixedZoomLevel[] {
+  const base =
+    scope === 'world' ? WORLD_FIXED_LEVELS_BASE : CZ_FIXED_LEVELS_BASE;
+  return base.map((item, idx) => ({
+    level: idx + 1,
+    zoom: idx === 0 ? Math.max(fitZoom, scope === 'world' ? 0.000018 : 0.0008) : item.zoom,
+    label: item.label,
+    osmZ: item.osmZ,
+  }));
+}
+
+function findNearestZoomIndex(
+  levels: FixedZoomLevel[],
+  targetZoom: number
+): number {
+  let bestIdx = 0;
+  let bestDiff = Infinity;
+  const logTarget = Math.log(Math.max(1e-7, targetZoom));
+  for (let i = 0; i < levels.length; i++) {
+    const diff = Math.abs(Math.log(levels[i].zoom) - logTarget);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
 
 export interface CzechMapCanvasHandle {
   zoomIn: () => void;
@@ -106,6 +171,7 @@ interface CzechMapCanvasProps {
   gpxHoverGeo: GeoPoint | null;
   onSelectPoint: (pt: SelectedMapPoint | null) => void;
   onSelectGpxTrack: (id: string) => void;
+  onEnterDetailScale?: (overlapsCz: boolean) => void;
 }
 
 interface PaletteConfig {
@@ -139,114 +205,114 @@ interface PaletteConfig {
 
 const PALETTES: Record<MapStylePreset, PaletteConfig> = {
   atlas: {
-    bg: '#EBE8DF',
-    outsideVeil: 'rgba(241, 239, 232, 0.56)',
-    hillshadeStrength: 0.34,
-    forestColor: [98, 142, 82],
-    forestOpacity: 0.24,
-    contourMinor: 'rgba(138, 88, 50, 0.21)',
-    contourIndex: 'rgba(110, 66, 36, 0.45)',
-    contourHalo: '#DFD2B2',
-    waterFill: '#6DB1E3',
-    waterStroke: '#2E6FA3',
-    borderOuter: 'rgba(255, 255, 255, 0.72)',
-    borderInner: '#36322D',
-    regionBorder: 'rgba(72, 64, 56, 0.35)',
-    highwayCasing: '#B45309',
-    highwayCore: '#FBBF24',
-    highwayBadgeBg: '#C82828',
+    bg: '#F3F2E9',
+    outsideVeil: 'rgba(243, 242, 233, 0.56)',
+    hillshadeStrength: 0.27,
+    forestColor: [188, 220, 158],
+    forestOpacity: 0.64,
+    contourMinor: 'rgba(164, 146, 122, 0.24)',
+    contourIndex: 'rgba(138, 116, 90, 0.44)',
+    contourHalo: '#F3F2E9',
+    waterFill: '#8EC0E8',
+    waterStroke: '#66A2D4',
+    borderOuter: 'rgba(116, 120, 114, 0.34)',
+    borderInner: 'rgba(34, 38, 34, 0.92)',
+    regionBorder: 'rgba(84, 88, 84, 0.38)',
+    highwayCasing: 'rgba(42, 118, 48, 0.92)',
+    highwayCore: '#58BC5E',
+    highwayBadgeBg: '#3A9642',
     highwayBadgeText: '#FFFFFF',
-    gridStroke: 'rgba(40, 52, 46, 0.14)',
-    gridText: 'rgba(40, 52, 46, 0.58)',
-    textPrimary: '#1A1F1C',
-    textSecondary: '#47524C',
-    textHalo: 'rgba(245, 242, 234, 0.88)',
-    cityDot: '#1A1F1C',
-    cityRing: '#FFFFFF',
-    peakColor: '#2D241E',
+    gridStroke: 'rgba(60, 72, 68, 0.11)',
+    gridText: 'rgba(60, 72, 68, 0.56)',
+    textPrimary: '#1F2421',
+    textSecondary: '#4A544E',
+    textHalo: 'rgba(255, 255, 255, 0.95)',
+    cityDot: '#7A5A3C',
+    cityRing: '#F5A65B',
+    peakColor: '#3A332C',
     isDark: false,
   },
   natural: {
-    bg: '#E3E5DC',
-    outsideVeil: 'rgba(229, 231, 224, 0.58)',
-    hillshadeStrength: 0.42,
-    forestColor: [64, 102, 58],
-    forestOpacity: 0.64,
-    contourMinor: 'rgba(92, 80, 64, 0.17)',
-    contourIndex: 'rgba(72, 60, 46, 0.38)',
-    contourHalo: '#C8CEB8',
-    waterFill: '#4A8BC2',
-    waterStroke: '#255B8A',
-    borderOuter: 'rgba(255, 255, 255, 0.68)',
-    borderInner: '#2C2E2A',
-    regionBorder: 'rgba(44, 46, 42, 0.34)',
-    highwayCasing: '#9A3412',
-    highwayCore: '#F59E0B',
-    highwayBadgeBg: '#B91C1C',
+    bg: '#F0EFE5',
+    outsideVeil: 'rgba(240, 239, 229, 0.56)',
+    hillshadeStrength: 0.34,
+    forestColor: [176, 212, 146],
+    forestOpacity: 0.68,
+    contourMinor: 'rgba(154, 134, 108, 0.24)',
+    contourIndex: 'rgba(128, 104, 78, 0.45)',
+    contourHalo: '#F0EFE5',
+    waterFill: '#86B8E2',
+    waterStroke: '#5E9ACC',
+    borderOuter: 'rgba(110, 114, 108, 0.34)',
+    borderInner: 'rgba(30, 34, 30, 0.92)',
+    regionBorder: 'rgba(80, 84, 80, 0.38)',
+    highwayCasing: 'rgba(40, 114, 46, 0.92)',
+    highwayCore: '#54B65A',
+    highwayBadgeBg: '#389240',
     highwayBadgeText: '#FFFFFF',
-    gridStroke: 'rgba(30, 40, 34, 0.14)',
-    gridText: 'rgba(30, 40, 34, 0.58)',
-    textPrimary: '#161C18',
-    textSecondary: '#38443D',
-    textHalo: 'rgba(240, 242, 236, 0.88)',
-    cityDot: '#161C18',
-    cityRing: '#FFFFFF',
-    peakColor: '#1E1A16',
+    gridStroke: 'rgba(48, 60, 54, 0.12)',
+    gridText: 'rgba(48, 60, 54, 0.58)',
+    textPrimary: '#1D221F',
+    textSecondary: '#455049',
+    textHalo: 'rgba(255, 255, 255, 0.94)',
+    cityDot: '#755638',
+    cityRing: '#F2A052',
+    peakColor: '#322B24',
     isDark: false,
   },
   light: {
-    bg: '#F4F3EE',
-    outsideVeil: 'rgba(246, 245, 241, 0.65)',
-    hillshadeStrength: 0.22,
-    forestColor: [188, 206, 178],
-    forestOpacity: 0.36,
-    contourMinor: 'rgba(130, 120, 108, 0.18)',
-    contourIndex: 'rgba(96, 88, 78, 0.38)',
-    contourHalo: '#F4F3EE',
-    waterFill: '#93C5E8',
-    waterStroke: '#4D89B8',
-    borderOuter: 'rgba(255, 255, 255, 0.85)',
-    borderInner: '#4A4E4B',
-    regionBorder: 'rgba(90, 94, 90, 0.28)',
-    highwayCasing: '#D97706',
-    highwayCore: '#FDE68A',
-    highwayBadgeBg: '#B91C1C',
+    bg: '#F8F7F2',
+    outsideVeil: 'rgba(248, 247, 242, 0.64)',
+    hillshadeStrength: 0.21,
+    forestColor: [200, 226, 174],
+    forestOpacity: 0.54,
+    contourMinor: 'rgba(168, 152, 132, 0.18)',
+    contourIndex: 'rgba(142, 124, 102, 0.36)',
+    contourHalo: '#F8F7F2',
+    waterFill: '#A4CEF0',
+    waterStroke: '#78B0DE',
+    borderOuter: 'rgba(124, 128, 122, 0.30)',
+    borderInner: 'rgba(42, 46, 42, 0.88)',
+    regionBorder: 'rgba(92, 96, 92, 0.34)',
+    highwayCasing: 'rgba(48, 124, 54, 0.88)',
+    highwayCore: '#64C26A',
+    highwayBadgeBg: '#3E9B47',
     highwayBadgeText: '#FFFFFF',
-    gridStroke: 'rgba(30, 40, 36, 0.10)',
-    gridText: 'rgba(60, 68, 64, 0.55)',
-    textPrimary: '#1D2220',
-    textSecondary: '#545E58',
-    textHalo: 'rgba(250, 249, 245, 0.92)',
-    cityDot: '#1D2220',
-    cityRing: '#FFFFFF',
-    peakColor: '#3C3630',
+    gridStroke: 'rgba(40, 52, 48, 0.09)',
+    gridText: 'rgba(72, 82, 78, 0.54)',
+    textPrimary: '#222725',
+    textSecondary: '#58625D',
+    textHalo: 'rgba(255, 255, 255, 0.96)',
+    cityDot: '#7D5E40',
+    cityRing: '#F6AC66',
+    peakColor: '#423B35',
     isDark: false,
   },
   dark: {
-    bg: '#141B20',
-    outsideVeil: 'rgba(16, 22, 27, 0.68)',
-    hillshadeStrength: 0.32,
-    forestColor: [38, 66, 52],
-    forestOpacity: 0.42,
-    contourMinor: 'rgba(148, 163, 184, 0.11)',
-    contourIndex: 'rgba(148, 163, 184, 0.25)',
+    bg: '#161D24',
+    outsideVeil: 'rgba(18, 24, 30, 0.68)',
+    hillshadeStrength: 0.36,
+    forestColor: [46, 86, 58],
+    forestOpacity: 0.46,
+    contourMinor: 'rgba(148, 163, 184, 0.12)',
+    contourIndex: 'rgba(148, 163, 184, 0.26)',
     contourHalo: '#1D272E',
-    waterFill: '#2A5B84',
-    waterStroke: '#508EC2',
-    borderOuter: 'rgba(15, 23, 30, 0.8)',
-    borderInner: '#CBD5E1',
+    waterFill: '#244A68',
+    waterStroke: '#487CA6',
+    borderOuter: 'rgba(0, 0, 0, 0.28)',
+    borderInner: 'rgba(148, 163, 184, 0.55)',
     regionBorder: 'rgba(148, 163, 184, 0.24)',
-    highwayCasing: '#92400E',
-    highwayCore: '#F59E0B',
-    highwayBadgeBg: '#DC2626',
+    highwayCasing: 'rgba(34, 98, 44, 0.88)',
+    highwayCore: '#469E50',
+    highwayBadgeBg: '#34823C',
     highwayBadgeText: '#FFFFFF',
     gridStroke: 'rgba(203, 213, 225, 0.09)',
     gridText: 'rgba(148, 163, 184, 0.65)',
     textPrimary: '#F1F5F9',
     textSecondary: '#94A3B8',
-    textHalo: 'rgba(20, 27, 32, 0.88)',
-    cityDot: '#F8FAFC',
-    cityRing: '#1E293B',
+    textHalo: 'rgba(20, 27, 34, 0.90)',
+    cityDot: '#9A6B3E',
+    cityRing: '#E09248',
     peakColor: '#E2E8F0',
     isDark: true,
   },
@@ -264,111 +330,212 @@ function lerpRgb(
   ];
 }
 
-// Hypsometric color ramp for physical Czech atlas
-function hypsometricAtlasColor(elev: number): [number, number, number] {
-  const stops: [number, [number, number, number]][] = [
-    [140, [175, 212, 148]], // Lowland alluvial green (Polabí, Dolnomoravský úval)
-    [230, [202, 226, 168]], // Lower plains
-    [350, [231, 235, 184]], // Rolling basins
-    [520, [238, 219, 164]], // Foothills / Vysočina
-    [750, [224, 186, 130]], // Uplands
-    [1020, [202, 145, 96]], // Mountains
-    [1320, [174, 110, 72]], // High ridges
-    [1600, [148, 92, 68]], // Alpine summits (Sněžka, Praděd)
-  ];
+// Smooth cubic Hermite interpolation across elevation stops so transitions between elevation bands are silky-smooth without flat plateaus or harsh band edges
+function evaluateSmoothColorStops(
+  elev: number,
+  stops: readonly [number, [number, number, number]][]
+): [number, number, number] {
   if (elev <= stops[0][0]) return stops[0][1];
-  for (let i = 0; i < stops.length - 1; i++) {
+  const lastIdx = stops.length - 1;
+  if (elev >= stops[lastIdx][0]) return stops[lastIdx][1];
+  for (let i = 0; i < lastIdx; i++) {
     const [e0, c0] = stops[i];
     const [e1, c1] = stops[i + 1];
     if (elev <= e1) {
-      return lerpRgb(c0, c1, (elev - e0) / (e1 - e0));
+      const u = Math.max(0, Math.min(1, (elev - e0) / (e1 - e0)));
+      // Blend 65% smoothstep + 35% linear for natural gradations without plateau banding
+      const s = u * u * (3 - 2 * u);
+      const t = u * 0.35 + s * 0.65;
+      return lerpRgb(c0, c1, t);
     }
   }
-  return stops[stops.length - 1][1];
+  return stops[lastIdx][1];
 }
 
-// Global world bathymetric & continental hypsometric color ramp (-8000 m .. +8849 m)
+// Bright, high-luminance Mapy.com base terrain ramp for Czechia (115 m .. 1603 m)
+// Keeps open non-forested land bright warm-ivory/cream so pastel green forests, golden roads, green motorways, and azure rivers pop clearly
+const CZ_ATLAS_STOPS: readonly [number, [number, number, number]][] = [
+  [115, [240, 243, 231]], // Lowest Elbe / Morava river gates (bright valley ivory-sage)
+  [175, [242, 243, 232]], // River floodplains & basins (Polabí, Dyjskosvratecký úval)
+  [235, [244, 243, 233]], // Lowland plains
+  [305, [244, 242, 231]], // Lower agricultural tablelands
+  [385, [243, 240, 228]], // Rolling hills (Středočeská pahorkatina)
+  [475, [241, 238, 225]], // Lower highlands
+  [575, [239, 235, 221]], // Českomoravská vrchovina (Vysočina)
+  [690, [237, 233, 217]], // Upper highlands & sub-mountain foothills
+  [820, [234, 230, 214]], // Lower mountain slopes (Šumava, Krušné hory)
+  [970, [231, 226, 210]], // Mid-mountain ridges
+  [1140, [228, 223, 207]], // High mountain massifs (Jeseníky, Beskydy)
+  [1340, [226, 222, 207]], // Subalpine ridges (Krkonoše, Hrubý Jeseník)
+  [1603, [234, 231, 218]], // Sunlit alpine summits (Sněžka 1603 m, Praděd 1491 m)
+];
+
+function hypsometricAtlasColor(elev: number): [number, number, number] {
+  return evaluateSmoothColorStops(elev, CZ_ATLAS_STOPS);
+}
+
+const CZ_NATURAL_STOPS: readonly [number, [number, number, number]][] = [
+  [115, [234, 240, 223]], // Lush alluvial valleys
+  [185, [237, 241, 226]], // Lowland basins
+  [260, [240, 241, 228]], // Fertile plains
+  [350, [241, 239, 226]], // Rolling countryside
+  [460, [239, 236, 222]], // Lower highlands
+  [580, [236, 232, 217]], // Uplands
+  [720, [233, 228, 212]], // Foothills
+  [880, [229, 224, 207]], // Mountain slopes
+  [1060, [226, 220, 203]], // Upper montane zone
+  [1260, [224, 219, 203]], // Subalpine zone
+  [1603, [232, 228, 215]], // Alpine granite crests
+];
+
+function naturalTerrainColor(elev: number): [number, number, number] {
+  return evaluateSmoothColorStops(elev, CZ_NATURAL_STOPS);
+}
+
+const CZ_LIGHT_STOPS: readonly [number, [number, number, number]][] = [
+  [115, [245, 247, 239]],
+  [220, [247, 248, 241]],
+  [360, [249, 248, 242]],
+  [520, [247, 245, 237]],
+  [720, [244, 241, 232]],
+  [960, [240, 237, 227]],
+  [1240, [237, 233, 223]],
+  [1603, [242, 239, 230]],
+];
+
+const CZ_DARK_STOPS: readonly [number, [number, number, number]][] = [
+  [115, [22, 33, 38]],
+  [230, [27, 38, 44]],
+  [370, [33, 44, 51]],
+  [530, [40, 50, 57]],
+  [720, [49, 58, 65]],
+  [950, [59, 67, 73]],
+  [1220, [71, 78, 84]],
+  [1603, [88, 95, 102]],
+];
+
+// Global Mapy.com-inspired bathymetric & continental terrain ramp (-8000 m .. +8849 m)
+const WORLD_OCEAN_ATLAS_STOPS: readonly [number, [number, number, number]][] = [
+  [-8000, [104, 168, 224]],
+  [-5500, [118, 180, 232]],
+  [-3500, [134, 193, 239]],
+  [-1800, [150, 206, 245]],
+  [-600, [166, 217, 249]],
+  [-120, [178, 225, 252]],
+  [0, [188, 230, 254]],
+];
+
+const WORLD_LAND_ATLAS_STOPS: readonly [number, [number, number, number]][] = [
+  [0, [238, 242, 228]],
+  [120, [241, 243, 231]],
+  [280, [244, 243, 232]],
+  [500, [243, 240, 228]],
+  [800, [240, 236, 222]],
+  [1200, [236, 231, 216]],
+  [1750, [232, 226, 210]],
+  [2400, [228, 221, 204]],
+  [3200, [224, 217, 200]],
+  [4200, [227, 221, 207]],
+  [5400, [236, 233, 225]],
+  [7000, [246, 246, 243]],
+  [8849, [253, 254, 255]],
+];
+
 function worldAtlasColor(elev: number): [number, number, number] {
   if (elev <= 0) {
-    const oceanStops: [number, [number, number, number]][] = [
-      [-8000, [48, 96, 152]],
-      [-4500, [74, 128, 186]],
-      [-2000, [106, 162, 214]],
-      [-350, [144, 194, 234]],
-      [0, [182, 220, 245]],
-    ];
-    if (elev <= oceanStops[0][0]) return oceanStops[0][1];
-    for (let i = 0; i < oceanStops.length - 1; i++) {
-      const [e0, c0] = oceanStops[i];
-      const [e1, c1] = oceanStops[i + 1];
-      if (elev <= e1) {
-        return lerpRgb(c0, c1, (elev - e0) / (e1 - e0));
-      }
-    }
-    return oceanStops[oceanStops.length - 1][1];
+    return evaluateSmoothColorStops(elev, WORLD_OCEAN_ATLAS_STOPS);
   }
-  const landStops: [number, [number, number, number]][] = [
-    [0, [170, 210, 144]],
-    [200, [202, 226, 168]],
-    [550, [234, 232, 182]],
-    [1100, [236, 208, 152]],
-    [1900, [218, 170, 118]],
-    [2900, [192, 132, 88]],
-    [4200, [164, 108, 76]],
-    [5800, [198, 192, 186]],
-    [8849, [250, 250, 250]],
-  ];
-  for (let i = 0; i < landStops.length - 1; i++) {
-    const [e0, c0] = landStops[i];
-    const [e1, c1] = landStops[i + 1];
-    if (elev <= e1) {
-      return lerpRgb(c0, c1, (elev - e0) / (e1 - e0));
-    }
-  }
-  return landStops[landStops.length - 1][1];
+  return evaluateSmoothColorStops(elev, WORLD_LAND_ATLAS_STOPS);
 }
+
+const WORLD_OCEAN_NATURAL_STOPS: readonly [number, [number, number, number]][] = [
+  [-8000, [94, 156, 212]],
+  [-4500, [116, 176, 226]],
+  [-1800, [140, 196, 238]],
+  [-300, [160, 210, 246]],
+  [0, [174, 219, 249]],
+];
+
+const WORLD_LAND_NATURAL_STOPS: readonly [number, [number, number, number]][] = [
+  [0, [232, 239, 221]],
+  [180, [237, 241, 226]],
+  [450, [240, 239, 226]],
+  [850, [237, 233, 218]],
+  [1400, [232, 226, 210]],
+  [2200, [226, 219, 202]],
+  [3200, [221, 213, 196]],
+  [4500, [226, 220, 208]],
+  [6200, [242, 243, 244]],
+  [8849, [252, 253, 255]],
+];
 
 function worldNaturalColor(elev: number): [number, number, number] {
   if (elev <= 0) {
-    const t = Math.max(0, Math.min(1, (elev + 7000) / 7000));
-    return lerpRgb([34, 68, 108], [94, 148, 192], t);
+    return evaluateSmoothColorStops(elev, WORLD_OCEAN_NATURAL_STOPS);
   }
-  const stops: [number, [number, number, number]][] = [
-    [0, [188, 200, 162]],
-    [400, [198, 204, 166]],
-    [1200, [182, 186, 148]],
-    [2400, [164, 162, 138]],
-    [4000, [152, 148, 138]],
-    [6200, [224, 226, 228]],
-  ];
-  for (let i = 0; i < stops.length - 1; i++) {
-    const [e0, c0] = stops[i];
-    const [e1, c1] = stops[i + 1];
-    if (elev <= e1) {
-      return lerpRgb(c0, c1, (elev - e0) / (e1 - e0));
-    }
-  }
-  return stops[stops.length - 1][1];
+  return evaluateSmoothColorStops(elev, WORLD_LAND_NATURAL_STOPS);
 }
 
-function naturalTerrainColor(elev: number): [number, number, number] {
-  const stops: [number, [number, number, number]][] = [
-    [150, [206, 210, 174]], // Cultivated valley fields
-    [320, [196, 202, 164]], // Plains & agriculture
-    [550, [178, 188, 148]], // Highlands
-    [880, [156, 166, 132]], // Mountain slopes
-    [1250, [148, 150, 134]], // Subalpine zone
-    [1580, [166, 162, 154]], // Granite summits
-  ];
-  if (elev <= stops[0][0]) return stops[0][1];
-  for (let i = 0; i < stops.length - 1; i++) {
-    const [e0, c0] = stops[i];
-    const [e1, c1] = stops[i + 1];
-    if (elev <= e1) {
-      return lerpRgb(c0, c1, (elev - e0) / (e1 - e0));
+function buildWorldLandMask(
+  countries: RealWorldDataset['countries'] | undefined,
+  cols: number,
+  rows: number,
+  x0: number,
+  y0: number,
+  patchWidth: number,
+  patchHeight: number
+): Uint8ClampedArray | null {
+  if (!countries || countries.length === 0) return null;
+  const scale = 2;
+  const w = (cols - 1) * scale;
+  const h = (rows - 1) * scale;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const tl = globalWorldToGeo(x0, y0);
+  const br = globalWorldToGeo(x0 + patchWidth, y0 + patchHeight);
+  const minLon = Math.min(tl.lon, br.lon) - 1;
+  const maxLon = Math.max(tl.lon, br.lon) + 1;
+  const minLat = Math.min(tl.lat, br.lat) - 1;
+  const maxLat = Math.max(tl.lat, br.lat) + 1;
+
+  const sxFactor = w / patchWidth;
+  const syFactor = h / patchHeight;
+
+  ctx.fillStyle = '#ffffff';
+  for (let c = 0; c < countries.length; c++) {
+    const country = countries[c];
+    if (
+      country.b &&
+      (country.b[2] < minLon ||
+        country.b[0] > maxLon ||
+        country.b[3] < minLat ||
+        country.b[1] > maxLat)
+    ) {
+      continue;
+    }
+    for (let r = 0; r < country.rings.length; r++) {
+      const ring = country.rings[r];
+      if (ring.length < 3) continue;
+      ctx.beginPath();
+      for (let i = 0; i < ring.length; i++) {
+        const pt = geoToGlobalWorld(ring[i][0], ring[i][1]);
+        const px = (pt.x - x0) * sxFactor;
+        const py = (pt.y - y0) * syFactor;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
     }
   }
-  return stops[stops.length - 1][1];
+  const maskData = ctx.getImageData(0, 0, w, h).data;
+  canvas.width = 0;
+  canvas.height = 0;
+  return maskData;
 }
 
 function rasterizeTerrainGrid(
@@ -379,7 +546,9 @@ function rasterizeTerrainGrid(
   rows: number,
   stylePreset: MapStylePreset,
   layers: LayerVisibility,
-  isWorld = false
+  isWorld = false,
+  renderOceanFromDem = true,
+  landMask?: Uint8ClampedArray | null
 ): HTMLCanvasElement {
   const scale = 2;
   const w = (cols - 1) * scale;
@@ -417,10 +586,13 @@ function rasterizeTerrainGrid(
       const elev = bilerp(elevationGrid);
       const hs = bilerp(hillshadeGrid);
       const forest = bilerp(forestGrid);
+      const outIdx = (py * w + px) * 4;
+      const isLandByMask = landMask ? landMask[outIdx + 3] > 32 : false;
+      const isOcean = isWorld && renderOceanFromDem && !isLandByMask && elev <= 0;
+      const landElev = Math.max(0, elev);
 
       let rgb: [number, number, number];
       if (isWorld) {
-        const isOcean = elev <= 0;
         if (stylePreset === 'dark') {
           if (isOcean) {
             const t = Math.max(0, Math.min(1, (elev + 7000) / 7000));
@@ -429,69 +601,101 @@ function rasterizeTerrainGrid(
               : [16, 26, 38];
           } else {
             rgb = layers.hypsometry
-              ? lerpRgb([32, 42, 50], [88, 102, 114], Math.min(1, elev / 4500))
+              ? evaluateSmoothColorStops(landElev, [
+                  [0, [24, 35, 42]],
+                  [350, [31, 42, 49]],
+                  [900, [40, 51, 58]],
+                  [1800, [52, 62, 69]],
+                  [3200, [68, 77, 85]],
+                  [5500, [92, 102, 112]],
+                ])
               : [34, 44, 52];
           }
         } else if (stylePreset === 'light') {
           if (isOcean) {
             const t = Math.max(0, Math.min(1, (elev + 7000) / 7000));
             rgb = layers.hypsometry
-              ? lerpRgb([184, 214, 238], [214, 234, 248], t)
+              ? lerpRgb([180, 212, 238], [216, 235, 249], t)
               : [204, 226, 244];
           } else {
             rgb = layers.hypsometry
-              ? lerpRgb([246, 245, 240], [218, 210, 198], Math.min(1, elev / 4200))
+              ? evaluateSmoothColorStops(landElev, [
+                  [0, [241, 246, 234]],
+                  [300, [248, 247, 239]],
+                  [850, [245, 239, 227]],
+                  [1700, [237, 227, 210]],
+                  [3000, [227, 214, 196]],
+                  [5200, [238, 234, 228]],
+                ])
               : [246, 245, 240];
           }
         } else if (stylePreset === 'natural') {
           rgb = layers.hypsometry
-            ? worldNaturalColor(elev)
+            ? isOcean
+              ? evaluateSmoothColorStops(elev, WORLD_OCEAN_NATURAL_STOPS)
+              : evaluateSmoothColorStops(landElev, WORLD_LAND_NATURAL_STOPS)
             : isOcean
-              ? [84, 136, 178]
-              : [206, 210, 184];
+              ? [148, 198, 236]
+              : [242, 241, 232];
         } else {
           rgb = layers.hypsometry
-            ? worldAtlasColor(elev)
+            ? isOcean
+              ? evaluateSmoothColorStops(elev, WORLD_OCEAN_ATLAS_STOPS)
+              : evaluateSmoothColorStops(landElev, WORLD_LAND_ATLAS_STOPS)
             : isOcean
-              ? [154, 198, 232]
-              : [238, 235, 224];
+              ? [166, 213, 247]
+              : [246, 244, 236];
         }
       } else if (stylePreset === 'dark') {
         rgb = layers.hypsometry
-          ? lerpRgb([30, 40, 48], [66, 78, 88], Math.min(1, (elev - 150) / 1300))
+          ? evaluateSmoothColorStops(elev, CZ_DARK_STOPS)
           : [34, 44, 52];
       } else if (stylePreset === 'light') {
         rgb = layers.hypsometry
-          ? lerpRgb([246, 245, 240], [228, 222, 210], Math.min(1, (elev - 150) / 1300))
-          : [246, 245, 240];
+          ? evaluateSmoothColorStops(elev, CZ_LIGHT_STOPS)
+          : [250, 249, 245];
       } else if (stylePreset === 'natural') {
-        rgb = layers.hypsometry ? naturalTerrainColor(elev) : [206, 210, 184];
+        rgb = layers.hypsometry ? naturalTerrainColor(elev) : [242, 241, 232];
       } else {
         rgb = layers.hypsometry
           ? hypsometricAtlasColor(elev)
-          : [238, 235, 224];
+          : [246, 244, 236];
       }
 
-      if (layers.forests && forest > 0.02 && (!isWorld || elev > 0)) {
+      if (layers.forests && forest > 0.02 && (!isWorld || !isOcean)) {
         rgb = lerpRgb(rgb, pal.forestColor, forest * pal.forestOpacity);
       }
 
       if (layers.hillshade) {
-        const hsMult = isWorld && elev <= 0 ? 0.45 : 1.0;
-        const shadeDelta =
-          (hs - 0.67) * pal.hillshadeStrength * hsMult * 255;
-        rgb = [
-          Math.max(0, Math.min(255, rgb[0] + shadeDelta)),
-          Math.max(0, Math.min(255, rgb[1] + shadeDelta)),
-          Math.max(0, Math.min(255, rgb[2] + shadeDelta)),
-        ];
+        const elevBoost = isOcean
+          ? 0.42
+          : isWorld
+            ? elev < 0
+              ? 0.35
+              : 0.92 + Math.min(0.28, landElev / 9500)
+            : 0.92 + Math.min(0.26, Math.max(0, elev - 200) / 3800);
+        const rawDelta = (hs - 0.67) * pal.hillshadeStrength * elevBoost * 255;
+
+        // Imhof chromatic relief shading: warm golden sunlight on NW slopes, cool crisp slate-umbral shadows on SE slopes
+        if (rawDelta >= 0) {
+          rgb = [
+            Math.max(0, Math.min(255, rgb[0] + rawDelta * 1.06)),
+            Math.max(0, Math.min(255, rgb[1] + rawDelta * 1.01)),
+            Math.max(0, Math.min(255, rgb[2] + rawDelta * 0.86)),
+          ];
+        } else {
+          rgb = [
+            Math.max(0, Math.min(255, rgb[0] + rawDelta * 1.05)),
+            Math.max(0, Math.min(255, rgb[1] + rawDelta * 0.98)),
+            Math.max(0, Math.min(255, rgb[2] + rawDelta * 0.84)),
+          ];
+        }
       }
 
       const grain = (((px * 73856093) ^ (py * 19349663)) & 7) - 3.5;
-      const outIdx = (py * w + px) * 4;
-      data[outIdx] = Math.max(0, Math.min(255, rgb[0] + grain * 0.4));
-      data[outIdx + 1] = Math.max(0, Math.min(255, rgb[1] + grain * 0.4));
-      data[outIdx + 2] = Math.max(0, Math.min(255, rgb[2] + grain * 0.4));
+      data[outIdx] = Math.max(0, Math.min(255, rgb[0] + grain * 0.35));
+      data[outIdx + 1] = Math.max(0, Math.min(255, rgb[1] + grain * 0.35));
+      data[outIdx + 2] = Math.max(0, Math.min(255, rgb[2] + grain * 0.35));
       data[outIdx + 3] = 255;
     }
   }
@@ -520,8 +724,18 @@ function buildCzechTerrainRaster(
 function buildWorldTerrainRaster(
   worldTerrain: CompiledWorldTerrain,
   stylePreset: MapStylePreset,
-  layers: LayerVisibility
+  layers: LayerVisibility,
+  countries?: RealWorldDataset['countries']
 ): HTMLCanvasElement {
+  const landMask = buildWorldLandMask(
+    countries,
+    WORLD_DEM_COLS,
+    WORLD_DEM_ROWS,
+    0,
+    0,
+    GLOBAL_WIDTH,
+    GLOBAL_HEIGHT
+  );
   return rasterizeTerrainGrid(
     worldTerrain.elevationGrid,
     worldTerrain.hillshadeGrid,
@@ -530,8 +744,307 @@ function buildWorldTerrainRaster(
     WORLD_DEM_ROWS,
     stylePreset,
     layers,
-    true
+    true,
+    true,
+    landMask
   );
+}
+
+function drawCroppedImage(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLCanvasElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  viewW: number,
+  viewH: number
+) {
+  if (dw <= 0 || dh <= 0 || img.width <= 0 || img.height <= 0) return;
+  const cdx0 = Math.max(0, dx);
+  const cdy0 = Math.max(0, dy);
+  const cdx1 = Math.min(viewW, dx + dw);
+  const cdy1 = Math.min(viewH, dy + dh);
+  const cdw = cdx1 - cdx0;
+  const cdh = cdy1 - cdy0;
+  if (cdw <= 0 || cdh <= 0) return;
+
+  const sx = Math.max(
+    0,
+    Math.min(img.width - 0.01, ((cdx0 - dx) / dw) * img.width)
+  );
+  const sy = Math.max(
+    0,
+    Math.min(img.height - 0.01, ((cdy0 - dy) / dh) * img.height)
+  );
+  const sw = Math.min(img.width - sx, (cdw / dw) * img.width);
+  const sh = Math.min(img.height - sy, (cdh / dh) * img.height);
+  if (sw <= 0.001 || sh <= 0.001) return;
+
+  ctx.drawImage(img, sx, sy, sw, sh, cdx0, cdy0, cdw, cdh);
+}
+
+// ============================================================================
+// SKIA-SAFE VIEWPORT CLIPPING (Prevents ±5M px coords & dashed-line OOM crashes)
+// ============================================================================
+
+function cohenOutCode(
+  x: number,
+  y: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number
+): number {
+  let code = 0;
+  if (x < minX) code |= 1;
+  else if (x > maxX) code |= 2;
+  if (y < minY) code |= 4;
+  else if (y > maxY) code |= 8;
+  return code;
+}
+
+/**
+ * Clips a single line segment (x0,y0)-(x1,y1) to [minX,maxX] x [minY,maxY]
+ * using Cohen-Sutherland and appends it to the current Canvas2D path.
+ * Guarantees zero offscreen dashes and bounded coordinates for Skia.
+ */
+function addClippedSegment(
+  ctx: CanvasRenderingContext2D,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number
+): boolean {
+  if (
+    !Number.isFinite(x0) ||
+    !Number.isFinite(y0) ||
+    !Number.isFinite(x1) ||
+    !Number.isFinite(y1)
+  ) {
+    return false;
+  }
+  let c0 = cohenOutCode(x0, y0, minX, minY, maxX, maxY);
+  let c1 = cohenOutCode(x1, y1, minX, minY, maxX, maxY);
+
+  // Bounded Cohen-Sutherland (a valid clip always completes within <= 4 steps)
+  for (let iter = 0; iter < 6; iter++) {
+    if ((c0 | c1) === 0) {
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      return true;
+    }
+    if ((c0 & c1) !== 0) return false;
+
+    const out = c0 !== 0 ? c0 : c1;
+    let x = 0;
+    let y = 0;
+    if (out & 8) {
+      const dy = y1 - y0;
+      if (Math.abs(dy) < 1e-9) return false;
+      x = x0 + ((x1 - x0) * (maxY - y0)) / dy;
+      y = maxY;
+    } else if (out & 4) {
+      const dy = y1 - y0;
+      if (Math.abs(dy) < 1e-9) return false;
+      x = x0 + ((x1 - x0) * (minY - y0)) / dy;
+      y = minY;
+    } else if (out & 2) {
+      const dx = x1 - x0;
+      if (Math.abs(dx) < 1e-9) return false;
+      y = y0 + ((y1 - y0) * (maxX - x0)) / dx;
+      x = maxX;
+    } else {
+      const dx = x1 - x0;
+      if (Math.abs(dx) < 1e-9) return false;
+      y = y0 + ((y1 - y0) * (minX - x0)) / dx;
+      x = minX;
+    }
+
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+
+    if (out === c0) {
+      x0 = x;
+      y0 = y;
+      c0 = cohenOutCode(x0, y0, minX, minY, maxX, maxY);
+    } else {
+      x1 = x;
+      y1 = y;
+      c1 = cohenOutCode(x1, y1, minX, minY, maxX, maxY);
+    }
+  }
+  return false;
+}
+
+/**
+ * Traces a geo polyline/ring onto ctx with exact viewport segment clipping.
+ * Returns true if at least one clipped segment was added.
+ */
+function traceClippedGeoPolyline(
+  ctx: CanvasRenderingContext2D,
+  pts: [number, number][],
+  project: (lon: number, lat: number) => Point2D,
+  wxToSx: (wx: number) => number,
+  wyToSy: (wy: number) => number,
+  width: number,
+  height: number,
+  closed = false
+): boolean {
+  const len = pts.length;
+  if (len < 2) return false;
+  const pad = 32;
+  const minX = -pad;
+  const minY = -pad;
+  const maxX = width + pad;
+  const maxY = height + pad;
+
+  const p0 = project(pts[0][0], pts[0][1]);
+  let prevX = wxToSx(p0.x);
+  let prevY = wyToSy(p0.y);
+  const startX = prevX;
+  const startY = prevY;
+  let drew = false;
+
+  for (let i = 1; i < len; i++) {
+    const p = project(pts[i][0], pts[i][1]);
+    const nx = wxToSx(p.x);
+    const ny = wyToSy(p.y);
+    if (addClippedSegment(ctx, prevX, prevY, nx, ny, minX, minY, maxX, maxY)) {
+      drew = true;
+    }
+    prevX = nx;
+    prevY = ny;
+  }
+  if (closed && len >= 3) {
+    if (
+      addClippedSegment(ctx, prevX, prevY, startX, startY, minX, minY, maxX, maxY)
+    ) {
+      drew = true;
+    }
+  }
+  return drew;
+}
+
+/**
+ * Traces a world-space Point2D polyline/ring with exact viewport segment clipping.
+ */
+function traceClippedWorldPolyline(
+  ctx: CanvasRenderingContext2D,
+  pts: Point2D[],
+  wxToSx: (wx: number) => number,
+  wyToSy: (wy: number) => number,
+  width: number,
+  height: number,
+  closed = false
+): boolean {
+  const len = pts.length;
+  if (len < 2) return false;
+  const pad = 32;
+  const minX = -pad;
+  const minY = -pad;
+  const maxX = width + pad;
+  const maxY = height + pad;
+
+  let prevX = wxToSx(pts[0].x);
+  let prevY = wyToSy(pts[0].y);
+  const startX = prevX;
+  const startY = prevY;
+  let drew = false;
+
+  for (let i = 1; i < len; i++) {
+    const nx = wxToSx(pts[i].x);
+    const ny = wyToSy(pts[i].y);
+    if (addClippedSegment(ctx, prevX, prevY, nx, ny, minX, minY, maxX, maxY)) {
+      drew = true;
+    }
+    prevX = nx;
+    prevY = ny;
+  }
+  if (closed && len >= 3) {
+    if (
+      addClippedSegment(ctx, prevX, prevY, startX, startY, minX, minY, maxX, maxY)
+    ) {
+      drew = true;
+    }
+  }
+  return drew;
+}
+
+/**
+ * Sutherland-Hodgman polygon clipping against [minX, maxX] x [minY, maxY].
+ * Keeps filled polygons (such as the 5,957-vertex Czech border mask) strictly
+ * bounded to the screen rect so Skia evenodd tessellation is fast and crash-free.
+ */
+function clipPolygonToRect(
+  pts: Point2D[],
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number
+): Point2D[] {
+  if (pts.length < 3) return [];
+
+  const clipEdge = (
+    input: Point2D[],
+    inside: (p: Point2D) => boolean,
+    intersect: (a: Point2D, b: Point2D) => Point2D
+  ): Point2D[] => {
+    if (input.length === 0) return [];
+    const output: Point2D[] = [];
+    let s = input[input.length - 1];
+    let sIn = inside(s);
+    for (let i = 0; i < input.length; i++) {
+      const e = input[i];
+      const eIn = inside(e);
+      if (eIn) {
+        if (!sIn) output.push(intersect(s, e));
+        output.push(e);
+      } else if (sIn) {
+        output.push(intersect(s, e));
+      }
+      s = e;
+      sIn = eIn;
+    }
+    return output;
+  };
+
+  let out = clipEdge(
+    pts,
+    (p) => p.x >= minX,
+    (a, b) => ({
+      x: minX,
+      y: a.y + ((b.y - a.y) * (minX - a.x)) / (b.x - a.x || 1e-9),
+    })
+  );
+  out = clipEdge(
+    out,
+    (p) => p.x <= maxX,
+    (a, b) => ({
+      x: maxX,
+      y: a.y + ((b.y - a.y) * (maxX - a.x)) / (b.x - a.x || 1e-9),
+    })
+  );
+  out = clipEdge(
+    out,
+    (p) => p.y >= minY,
+    (a, b) => ({
+      x: a.x + ((b.x - a.x) * (minY - a.y)) / (b.y - a.y || 1e-9),
+      y: minY,
+    })
+  );
+  out = clipEdge(
+    out,
+    (p) => p.y <= maxY,
+    (a, b) => ({
+      x: a.x + ((b.x - a.x) * (maxY - a.y)) / (b.y - a.y || 1e-9),
+      y: maxY,
+    })
+  );
+  return out;
 }
 
 function drawSmoothPoints(ctx: CanvasRenderingContext2D, pts: Point2D[]) {
@@ -673,6 +1186,7 @@ export const CzechMapCanvas = forwardRef<
     gpxHoverGeo,
     onSelectPoint,
     onSelectGpxTrack,
+    onEnterDetailScale,
   },
   ref
 ) {
@@ -683,8 +1197,7 @@ export const CzechMapCanvas = forwardRef<
 
   const activeWidth = mapScope === 'world' ? GLOBAL_WIDTH : WORLD_WIDTH;
   const activeHeight = mapScope === 'world' ? GLOBAL_HEIGHT : WORLD_HEIGHT;
-  const minZoom = mapScope === 'world' ? 0.000018 : 0.0007;
-  const maxZoom = 0.45;
+  const minZoom = mapScope === 'world' ? 0.000018 : 0.0008;
 
   const projectGeo = useCallback(
     (lon: number, lat: number): Point2D =>
@@ -704,11 +1217,27 @@ export const CzechMapCanvas = forwardRef<
     return Math.max(minZoom, Math.min(zx, zy));
   }, [viewportSize, activeWidth, activeHeight, minZoom]);
 
+  const zoomLevels = useMemo(
+    () => buildFixedZoomLevels(mapScope, fitZoom),
+    [mapScope, fitZoom]
+  );
+
   const [camera, setCamera] = useState({
     cx: activeWidth * 0.5,
     cy: activeHeight * 0.49,
-    zoom: mapScope === 'world' ? 0.000032 : 0.0018,
+    zoom: zoomLevels[0].zoom,
   });
+
+  const activeZoomIndex = useMemo(
+    () => findNearestZoomIndex(zoomLevels, camera.zoom),
+    [zoomLevels, camera.zoom]
+  );
+  const activeZoomLevel = zoomLevels[activeZoomIndex] ?? zoomLevels[0];
+
+  const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
+  const wheelCooldownRef = useRef<number>(0);
+  const wheelAccumRef = useRef<number>(0);
+  const lastHoverCheckRef = useRef<number>(0);
 
   const [cursorWorld, setCursorWorld] = useState<Point2D | null>(null);
   const [hoveredEntity, setHoveredEntity] = useState<string | null>(null);
@@ -729,6 +1258,30 @@ export const CzechMapCanvas = forwardRef<
     startCy: 0,
   });
 
+  const setZoomToLevelIndex = useCallback(
+    (targetIdx: number, anchorSx?: number, anchorSy?: number) => {
+      const clampedIdx = Math.max(
+        0,
+        Math.min(zoomLevels.length - 1, targetIdx)
+      );
+      const nextZoom = zoomLevels[clampedIdx].zoom;
+      setCamera((c) => {
+        if (Math.abs(c.zoom - nextZoom) < 1e-9) return c;
+        if (anchorSx !== undefined && anchorSy !== undefined) {
+          const wx = c.cx + (anchorSx - viewportSize.width / 2) / c.zoom;
+          const wy = c.cy + (anchorSy - viewportSize.height / 2) / c.zoom;
+          return {
+            zoom: nextZoom,
+            cx: wx - (anchorSx - viewportSize.width / 2) / nextZoom,
+            cy: wy - (anchorSy - viewportSize.height / 2) / nextZoom,
+          };
+        }
+        return { ...c, zoom: nextZoom };
+      });
+    },
+    [zoomLevels, viewportSize.width, viewportSize.height]
+  );
+
   // Fit on initial mount
   const initializedRef = useRef(false);
   useEffect(() => {
@@ -737,15 +1290,19 @@ export const CzechMapCanvas = forwardRef<
     const update = () => {
       const w = el.clientWidth;
       const h = el.clientHeight;
-      setViewportSize({ width: w, height: h });
+      setViewportSize((prev) =>
+        prev.width === w && prev.height === h ? prev : { width: w, height: h }
+      );
       if (!initializedRef.current && w > 0 && h > 0) {
         initializedRef.current = true;
         const zx = (w * 0.95) / activeWidth;
         const zy = (h * 0.92) / activeHeight;
+        const initFit = Math.max(minZoom, Math.min(zx, zy));
+        const initLevels = buildFixedZoomLevels(mapScope, initFit);
         setCamera({
           cx: activeWidth * 0.5,
           cy: activeHeight * 0.49,
-          zoom: Math.min(zx, zy),
+          zoom: initLevels[0].zoom,
         });
       }
     };
@@ -753,7 +1310,7 @@ export const CzechMapCanvas = forwardRef<
     const ro = new ResizeObserver(update);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [activeWidth, activeHeight]);
+  }, [activeWidth, activeHeight, mapScope, minZoom]);
 
   // Reset camera when switching between Czechia and World scope
   const prevScopeRef = useRef<MapScope>(mapScope);
@@ -764,34 +1321,60 @@ export const CzechMapCanvas = forwardRef<
       const h = viewportSize.height || 700;
       const sw = mapScope === 'world' ? GLOBAL_WIDTH : WORLD_WIDTH;
       const sh = mapScope === 'world' ? GLOBAL_HEIGHT : WORLD_HEIGHT;
+      const sMin = mapScope === 'world' ? 0.000018 : 0.0008;
       const zx = (w * 0.95) / sw;
       const zy = (h * 0.92) / sh;
+      const nextLevels = buildFixedZoomLevels(
+        mapScope,
+        Math.max(sMin, Math.min(zx, zy))
+      );
       setCamera({
         cx: sw * 0.5,
         cy: sh * 0.49,
-        zoom: Math.min(zx, zy),
+        zoom: nextLevels[0].zoom,
       });
       setLocalPatch(null);
       setCursorWorld(null);
+      setZoomMenuOpen(false);
     }
   }, [mapScope, viewportSize.width, viewportSize.height]);
 
-  const czechTerrainRaster = useMemo(
-    () =>
-      buildCzechTerrainRaster(terrain, stylePreset, {
-        ...layers,
-        forests: false,
-      }),
-    [terrain, stylePreset, layers]
-  );
+  // Build terrain raster ONLY for the active scope & ONLY when terrain-affecting flags change
+  const activeTerrainRaster = useMemo(() => {
+    const terrainLayerFlags: LayerVisibility = {
+      ...layers,
+      forests: mapScope === 'world' ? layers.forests : false,
+    };
+    return mapScope === 'world'
+      ? buildWorldTerrainRaster(
+          worldTerrain,
+          stylePreset,
+          terrainLayerFlags,
+          worldDataset?.countries
+        )
+      : buildCzechTerrainRaster(terrain, stylePreset, terrainLayerFlags);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    mapScope,
+    terrain,
+    worldTerrain,
+    worldDataset,
+    stylePreset,
+    layers.hillshade,
+    layers.hypsometry,
+    layers.forests,
+  ]);
 
-  const worldTerrainRaster = useMemo(
-    () => buildWorldTerrainRaster(worldTerrain, stylePreset, layers),
-    [worldTerrain, stylePreset, layers]
-  );
-
-  const activeTerrainRaster =
-    mapScope === 'world' ? worldTerrainRaster : czechTerrainRaster;
+  // Safely release ONLY replaced terrain raster GPU backing stores
+  const prevTerrainRasterRef = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const prev = prevTerrainRasterRef.current;
+    if (prev && prev !== activeTerrainRaster) {
+      prev.width = 0;
+      prev.height = 0;
+    }
+    prevTerrainRasterRef.current = activeTerrainRaster;
+  }, [activeTerrainRaster]);
 
   // Local high-res viewport terrain refinement + live AWS Terrarium streaming
   const [localPatch, setLocalPatch] = useState<{
@@ -799,9 +1382,71 @@ export const CzechMapCanvas = forwardRef<
     raster: HTMLCanvasElement;
     scope: MapScope;
   } | null>(null);
+
+  const prevLocalPatchRasterRef = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const nextRaster = localPatch?.raster ?? null;
+    const prev = prevLocalPatchRasterRef.current;
+    if (prev && prev !== nextRaster) {
+      prev.width = 0;
+      prev.height = 0;
+    }
+    prevLocalPatchRasterRef.current = nextRaster;
+  }, [localPatch]);
   const [tileRevision, setTileRevision] = useState(0);
   const [blockRevision, setBlockRevision] = useState(0);
   const [osmRevision, setOsmRevision] = useState(0);
+
+  const osmTimerRef = useRef<number | null>(null);
+  const blockTimerRef = useRef<number | null>(null);
+
+  const scheduleOsmRedraw = useCallback(() => {
+    if (osmTimerRef.current !== null) return;
+    osmTimerRef.current = window.setTimeout(() => {
+      osmTimerRef.current = null;
+      setOsmRevision((v) => v + 1);
+    }, 65);
+  }, []);
+
+  const scheduleBlockRedraw = useCallback(() => {
+    if (blockTimerRef.current !== null) return;
+    blockTimerRef.current = window.setTimeout(() => {
+      blockTimerRef.current = null;
+      setBlockRevision((v) => v + 1);
+    }, 65);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (osmTimerRef.current !== null) window.clearTimeout(osmTimerRef.current);
+      if (blockTimerRef.current !== null)
+        window.clearTimeout(blockTimerRef.current);
+    };
+  }, []);
+
+  // Trigger lazy loading of global places index & Czech dataset only when user enters detail scale
+  useEffect(() => {
+    if (!onEnterDetailScale || mapScope !== 'world') return;
+    if (camera.zoom < DETAIL_WORLD_ZOOM) return;
+    const halfW = (viewportSize.width / 2) / camera.zoom;
+    const halfH = (viewportSize.height / 2) / camera.zoom;
+    const tl = globalWorldToGeo(camera.cx - halfW, camera.cy - halfH);
+    const br = globalWorldToGeo(camera.cx + halfW, camera.cy + halfH);
+    const overlapsCz =
+      br.lon >= CZ_BOUNDS.minLon - 0.5 &&
+      tl.lon <= CZ_BOUNDS.maxLon + 0.5 &&
+      tl.lat >= CZ_BOUNDS.minLat - 0.5 &&
+      br.lat <= CZ_BOUNDS.maxLat + 0.5;
+    onEnterDetailScale(overlapsCz);
+  }, [
+    onEnterDetailScale,
+    mapScope,
+    camera.cx,
+    camera.cy,
+    camera.zoom,
+    viewportSize.width,
+    viewportSize.height,
+  ]);
 
   useEffect(() => {
     const thresholdZoom = mapScope === 'world' ? 0.00011 : 0.0036;
@@ -810,7 +1455,7 @@ export const CzechMapCanvas = forwardRef<
       return;
     }
     let cancelled = false;
-    const timer = window.setTimeout(() => {
+    const timer = window.setTimeout(async () => {
       const halfW = (viewportSize.width / camera.zoom) * 0.68;
       const halfH = (viewportSize.height / camera.zoom) * 0.68;
       const x0 = Math.max(0, camera.cx - halfW);
@@ -819,10 +1464,39 @@ export const CzechMapCanvas = forwardRef<
       const y1 = Math.min(activeHeight, camera.cy + halfH);
       if (x1 - x0 < 300 || y1 - y0 < 300) return;
 
+      const patchLayers = {
+        hypsometry: layers.hypsometry,
+        hillshade: layers.hillshade,
+        contours: layers.contours,
+        forests: layers.forests,
+        hydrology: false,
+        highways: false,
+        railways: false,
+        borders: false,
+        districts: false,
+        cities: false,
+        peaks: false,
+        graticule: false,
+      };
+
       if (mapScope === 'world') {
-        const targetZ = worldDataset?.dem
-          ? pickWorldTerrariumZoom(camera.zoom)
-          : undefined;
+        if (!worldDataset?.dem) return;
+        const targetZ = pickWorldTerrariumZoom(camera.zoom);
+        if (targetZ > 0) {
+          const tl = globalWorldToGeo(x0, y0);
+          const br = globalWorldToGeo(x1, y1);
+          const loadedNew = await ensureViewportTerrariumTiles(
+            tl.lon,
+            br.lon,
+            br.lat,
+            tl.lat,
+            targetZ
+          );
+          if (cancelled) return;
+          if (loadedNew) {
+            setTileRevision((v) => v + 1);
+          }
+        }
 
         const patch = compileWorldViewportTerrain(
           x0,
@@ -830,15 +1504,26 @@ export const CzechMapCanvas = forwardRef<
           x1 - x0,
           y1 - y0,
           camera.zoom,
-          layers.contours,
-          worldDataset?.dem,
-          targetZ,
+          patchLayers.contours,
+          worldDataset.dem,
+          targetZ > 0 ? targetZ : undefined,
           realDataset?.dem
         );
-        const worldPatchLayers =
-          camera.zoom >= DETAIL_WORLD_ZOOM
-            ? { ...layers, forests: false }
-            : layers;
+        const isDetailWorld = camera.zoom >= DETAIL_WORLD_ZOOM;
+        const worldPatchLayers = isDetailWorld
+          ? { ...patchLayers, forests: false }
+          : patchLayers;
+        const patchLandMask = isDetailWorld
+          ? null
+          : buildWorldLandMask(
+              worldDataset.countries,
+              patch.cols,
+              patch.rows,
+              patch.x0,
+              patch.y0,
+              patch.width,
+              patch.height
+            );
         const raster = rasterizeTerrainGrid(
           patch.elevationGrid,
           patch.hillshadeGrid,
@@ -847,31 +1532,31 @@ export const CzechMapCanvas = forwardRef<
           patch.rows,
           stylePreset,
           worldPatchLayers,
-          true
+          true,
+          !isDetailWorld,
+          patchLandMask
         );
         if (!cancelled) {
           setLocalPatch({ patch, raster, scope: 'world' });
         }
-
-        if (worldDataset?.dem && targetZ) {
-          const tl = globalWorldToGeo(x0, y0);
-          const br = globalWorldToGeo(x1, y1);
-          ensureViewportTerrariumTiles(
+      } else {
+        if (!realDataset?.dem) return;
+        const targetZ = pickTerrariumZoom(camera.zoom);
+        if (targetZ > 0) {
+          const tl = worldToGeo(x0, y0);
+          const br = worldToGeo(x1, y1);
+          const loadedNew = await ensureViewportTerrariumTiles(
             tl.lon,
             br.lon,
             br.lat,
             tl.lat,
             targetZ
-          ).then((loadedNew) => {
-            if (!cancelled && loadedNew) {
-              setTileRevision((v) => v + 1);
-            }
-          });
+          );
+          if (cancelled) return;
+          if (loadedNew) {
+            setTileRevision((v) => v + 1);
+          }
         }
-      } else {
-        const targetZ = realDataset?.dem
-          ? pickTerrariumZoom(camera.zoom)
-          : undefined;
 
         const patch = compileLocalViewportTerrain(
           x0,
@@ -879,9 +1564,9 @@ export const CzechMapCanvas = forwardRef<
           x1 - x0,
           y1 - y0,
           camera.zoom,
-          layers.contours,
-          realDataset?.dem,
-          targetZ
+          patchLayers.contours,
+          realDataset.dem,
+          targetZ > 0 ? targetZ : undefined
         );
         const raster = rasterizeTerrainGrid(
           patch.elevationGrid,
@@ -890,30 +1575,14 @@ export const CzechMapCanvas = forwardRef<
           patch.cols,
           patch.rows,
           stylePreset,
-          { ...layers, forests: false },
+          { ...patchLayers, forests: false },
           false
         );
         if (!cancelled) {
           setLocalPatch({ patch, raster, scope: 'cz' });
         }
-
-        if (realDataset?.dem && targetZ && camera.zoom >= 0.0045) {
-          const tl = worldToGeo(x0, y0);
-          const br = worldToGeo(x1, y1);
-          ensureViewportTerrariumTiles(
-            tl.lon,
-            br.lon,
-            br.lat,
-            tl.lat,
-            targetZ
-          ).then((loadedNew) => {
-            if (!cancelled && loadedNew) {
-              setTileRevision((v) => v + 1);
-            }
-          });
-        }
       }
-    }, 95);
+    }, 160);
 
     return () => {
       cancelled = true;
@@ -929,10 +1598,12 @@ export const CzechMapCanvas = forwardRef<
     viewportSize.width,
     viewportSize.height,
     stylePreset,
-    layers,
+    layers.hypsometry,
+    layers.hillshade,
+    layers.contours,
+    layers.forests,
     realDataset,
     worldDataset,
-    tileRevision,
   ]);
 
   // Pre-projected official Czech border polygon in Czech world meters
@@ -973,26 +1644,52 @@ export const CzechMapCanvas = forwardRef<
       const sheetW = activeWidth * cam.zoom;
       const sheetH = activeHeight * cam.zoom;
 
-      // 1. Draw Base Terrain Raster + Local High-Res Refinement Patch
+      // 1. Draw Base Terrain Raster + Local High-Res Refinement Patch (viewport-cropped for Skia safety)
       ctx.save();
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(activeTerrainRaster, sheetX, sheetY, sheetW, sheetH);
 
       const patchThreshold = mapScope === 'world' ? 0.00011 : 0.0036;
-      if (
+      const hasActivePatch = Boolean(
         localPatch &&
-        localPatch.scope === mapScope &&
-        !forExport &&
-        cam.zoom >= patchThreshold
-      ) {
+          localPatch.scope === mapScope &&
+          !forExport &&
+          cam.zoom >= patchThreshold
+      );
+      let patchCoversViewport = false;
+      if (hasActivePatch && localPatch) {
+        const px0 = wxToSx(localPatch.patch.x0);
+        const py0 = wyToSy(localPatch.patch.y0);
+        const pw = localPatch.patch.width * cam.zoom;
+        const ph = localPatch.patch.height * cam.zoom;
+        patchCoversViewport =
+          px0 <= 0 && py0 <= 0 && px0 + pw >= width && py0 + ph >= height;
+      }
+
+      if (!patchCoversViewport) {
+        drawCroppedImage(
+          ctx,
+          activeTerrainRaster,
+          sheetX,
+          sheetY,
+          sheetW,
+          sheetH,
+          width,
+          height
+        );
+      }
+
+      if (hasActivePatch && localPatch) {
         const { patch, raster } = localPatch;
-        ctx.drawImage(
+        drawCroppedImage(
+          ctx,
           raster,
           wxToSx(patch.x0),
           wyToSy(patch.y0),
           patch.width * cam.zoom,
-          patch.height * cam.zoom
+          patch.height * cam.zoom,
+          width,
+          height
         );
       }
 
@@ -1027,12 +1724,12 @@ export const CzechMapCanvas = forwardRef<
         // =====================================================================
         const isDetailScale = cam.zoom >= DETAIL_WORLD_ZOOM;
         const tlGeo = globalWorldToGeo(
-          cam.cx - (width * 0.56) / cam.zoom,
-          cam.cy - (height * 0.56) / cam.zoom
+          cam.cx - (width * 0.505) / cam.zoom,
+          cam.cy - (height * 0.505) / cam.zoom
         );
         const brGeo = globalWorldToGeo(
-          cam.cx + (width * 0.56) / cam.zoom,
-          cam.cy + (height * 0.56) / cam.zoom
+          cam.cx + (width * 0.505) / cam.zoom,
+          cam.cy + (height * 0.505) / cam.zoom
         );
         const viewMinLon = Math.min(tlGeo.lon, brGeo.lon);
         const viewMaxLon = Math.max(tlGeo.lon, brGeo.lon);
@@ -1057,25 +1754,35 @@ export const CzechMapCanvas = forwardRef<
               viewMaxLon,
               viewMinLat,
               viewMaxLat,
-              () => setBlockRevision((v) => v + 1),
+              scheduleBlockRedraw,
               1.8
             )
           : { loadedBlocks: [], activeMetas: [] };
 
-        // Stream high-detail OpenStreetMap vector tiles globally at detail scale (<= 1 : 3 000 000)
-        const worldOsmTargetZ = isDetailScale
-          ? pickOsmVectorZoom(viewMaxLon - viewMinLon, 7, 14)
-          : 7;
-        const { tiles: worldOsmTiles } = isDetailScale
-          ? ensureOsmVectorTilesForViewport(
-              viewMinLon,
-              viewMaxLon,
-              viewMinLat,
-              viewMaxLat,
-              worldOsmTargetZ,
-              () => setOsmRevision((v) => v + 1)
-            )
-          : { tiles: [] };
+        // Stream pre-rasterized OpenStreetMap tile bitmaps at fixed discrete zoom levels (>= Stupeň 6 / 1 : 3 000 000)
+        const worldLevelSpec =
+          zoomLevels[findNearestZoomIndex(zoomLevels, cam.zoom)];
+        const worldOsmTargetZ = worldLevelSpec?.osmZ ?? 7;
+        const worldOsmOpts = buildOsmRenderOptions(
+          stylePreset,
+          layers,
+          pal,
+          layers.borders,
+          layers.districts
+        );
+        const worldOsmRes =
+          isDetailScale && worldLevelSpec?.osmZ !== null
+            ? ensureOsmVectorTilesForViewport(
+                viewMinLon,
+                viewMaxLon,
+                viewMinLat,
+                viewMaxLat,
+                worldOsmTargetZ,
+                worldOsmOpts,
+                scheduleOsmRedraw
+              )
+            : { tiles: [], targetZ: worldOsmTargetZ };
+        const worldOsmTiles = worldOsmRes.tiles;
         const worldHasOsm = worldOsmTiles.length > 0;
         const worldOsmRc: OsmRenderContext = {
           ctx,
@@ -1092,9 +1799,9 @@ export const CzechMapCanvas = forwardRef<
           tryPlaceBox,
         };
 
-        // 1bW. Real OSM Forests, Wetlands, Glaciers, Protected Parks, Built-up Urban & Buildings
+        // 1bW. Pre-rasterized OSM Base Bitmaps (Forests, Wetlands, Glaciers, Parks, Built-up Urban & Buildings)
         if (isDetailScale && worldHasOsm) {
-          renderOsmLandcoverAndUrban(worldOsmTiles, worldOsmRc);
+          renderOsmBaseBitmaps(worldOsmTiles, worldOsmRc);
         }
 
         // 2W. WGS84 Global Graticule (adaptive 30° / 15° / 5° / 1° / 0.5° / 0.25° / 0.1°)
@@ -1190,51 +1897,84 @@ export const CzechMapCanvas = forwardRef<
           const activeContours = useLocalContours
             ? localPatch.patch.contours
             : worldTerrain.contours;
-          const showMinor = useLocalContours || cam.zoom >= 0.00008;
+          const showMinor = useLocalContours || cam.zoom >= 0.006;
+          ctx.save();
+          if (cam.zoom < 0.012) {
+            ctx.globalAlpha = cam.zoom < 0.005 ? 0.35 : 0.6;
+          }
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
 
           if (showMinor) {
             ctx.strokeStyle = pal.contourMinor;
-            ctx.lineWidth = isDetailScale ? 0.45 : 0.4;
+            ctx.lineWidth = isDetailScale ? 0.42 : 0.38;
+            let segCount = 0;
             ctx.beginPath();
             for (const level of activeContours) {
               if (level.isIndex) continue;
               for (const poly of level.polylines) {
-                for (let i = 0; i < poly.length; i++) {
-                  const sx = wxToSx(poly[i].x);
-                  const sy = wyToSy(poly[i].y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
+                if (
+                  traceClippedWorldPolyline(
+                    ctx,
+                    poly,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  segCount += poly.length;
+                  if (segCount >= 3500) {
+                    ctx.stroke();
+                    ctx.beginPath();
+                    segCount = 0;
+                  }
                 }
               }
             }
-            ctx.stroke();
+            if (segCount > 0) ctx.stroke();
           }
 
           ctx.strokeStyle = pal.contourIndex;
           ctx.lineWidth = isDetailScale
-            ? 0.8
+            ? 0.72
             : cam.zoom >= 0.0002
-              ? 0.72
-              : 0.58;
-          ctx.beginPath();
-          for (const level of activeContours) {
-            if (!level.isIndex) continue;
-            for (const poly of level.polylines) {
-              for (let i = 0; i < poly.length; i++) {
-                const sx = wxToSx(poly[i].x);
-                const sy = wyToSy(poly[i].y);
-                if (i === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
+              ? 0.64
+              : 0.52;
+          {
+            let segCount = 0;
+            ctx.beginPath();
+            for (const level of activeContours) {
+              if (!level.isIndex) continue;
+              for (const poly of level.polylines) {
+                if (
+                  traceClippedWorldPolyline(
+                    ctx,
+                    poly,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  segCount += poly.length;
+                  if (segCount >= 3500) {
+                    ctx.stroke();
+                    ctx.beginPath();
+                    segCount = 0;
+                  }
+                }
               }
             }
+            if (segCount > 0) ctx.stroke();
           }
-          ctx.stroke();
+          ctx.restore();
 
-          // Inline contour elevation numbers at scale <= 1 : 2 000 000
-          if (isDetailScale) {
-            ctx.font = '500 9px "JetBrains Mono", monospace';
+          // Inline contour elevation numbers only at close tourist zoom
+          if (cam.zoom >= 0.024) {
+            ctx.font = '500 8.5px "JetBrains Mono", monospace';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             for (const level of activeContours) {
@@ -1253,7 +1993,7 @@ export const CzechMapCanvas = forwardRef<
                 ctx.save();
                 ctx.translate(sx, sy);
                 ctx.rotate(ang);
-                ctx.lineWidth = 3;
+                ctx.lineWidth = 2.6;
                 ctx.strokeStyle = pal.contourHalo;
                 ctx.strokeText(`${level.elevation}`, 0, 0);
                 ctx.fillStyle = pal.contourIndex;
@@ -1283,7 +2023,13 @@ export const CzechMapCanvas = forwardRef<
             const y0 = wyToSy(pTL.y);
             const x1 = wxToSx(pBR.x);
             const y1 = wyToSy(pBR.y);
-            ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+            const cx0 = Math.max(-16, Math.min(width + 16, x0));
+            const cy0 = Math.max(-16, Math.min(height + 16, y0));
+            const cx1 = Math.max(-16, Math.min(width + 16, x1));
+            const cy1 = Math.max(-16, Math.min(height + 16, y1));
+            if (cx1 > cx0 && cy1 > cy0) {
+              ctx.strokeRect(cx0, cy0, cx1 - cx0, cy1 - cy0);
+            }
             const lx = Math.max(54, Math.min(width - 96, x0 + 8));
             const ly = Math.max(28, Math.min(height - 32, y0 + 14));
             if (lx >= x0 + 4 && lx <= x1 - 54 && ly >= y0 + 8 && ly <= y1 - 8) {
@@ -1306,14 +2052,20 @@ export const CzechMapCanvas = forwardRef<
                 if (!bboxVisible(reg.b)) continue;
                 for (const line of reg.l) {
                   ctx.beginPath();
-                  line.forEach(([lon, lat], i) => {
-                    const wPt = geoToGlobalWorld(lon, lat);
-                    const sx = wxToSx(wPt.x);
-                    const sy = wyToSy(wPt.y);
-                    if (i === 0) ctx.moveTo(sx, sy);
-                    else ctx.lineTo(sx, sy);
-                  });
-                  ctx.stroke();
+                  if (
+                    traceClippedGeoPolyline(
+                      ctx,
+                      line,
+                      geoToGlobalWorld,
+                      wxToSx,
+                      wyToSy,
+                      width,
+                      height,
+                      false
+                    )
+                  ) {
+                    ctx.stroke();
+                  }
                 }
               }
             }
@@ -1330,15 +2082,20 @@ export const CzechMapCanvas = forwardRef<
             for (const okr of realDataset.admin.okresy) {
               for (const ring of okr.rings) {
                 ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.closePath();
-                ctx.stroke();
+                if (
+                  traceClippedGeoPolyline(
+                    ctx,
+                    ring,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    true
+                  )
+                ) {
+                  ctx.stroke();
+                }
               }
             }
             ctx.restore();
@@ -1350,15 +2107,20 @@ export const CzechMapCanvas = forwardRef<
             for (const kraj of realDataset.admin.kraje) {
               for (const ring of kraj.rings) {
                 ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.closePath();
-                ctx.stroke();
+                if (
+                  traceClippedGeoPolyline(
+                    ctx,
+                    ring,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    true
+                  )
+                ) {
+                  ctx.stroke();
+                }
               }
             }
             ctx.restore();
@@ -1371,34 +2133,40 @@ export const CzechMapCanvas = forwardRef<
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
           if (isDetailScale) {
-            // 1) Keep crisp 10m coastlines from active logical blocks (and fallback borders if OSM tile still loading)
-            if (layers.borders) {
+            // 1) Fallback 10m coastlines & borders while OSM tiles load (when OSM tiles are loaded, exact OSM coastlines & borders replace them)
+            if (layers.borders && !worldHasOsm) {
               for (const blk of loadedBlocks) {
                 if (!blk.borders) continue;
                 for (const bnd of blk.borders) {
                   if (!bboxVisible(bnd.b)) continue;
                   const isCoast = bnd.c === 1;
-                  if (!isCoast && worldHasOsm) continue;
                   for (const line of bnd.l) {
                     if (line.length < 2) continue;
                     ctx.beginPath();
-                    line.forEach(([lon, lat], i) => {
-                      const wPt = geoToGlobalWorld(lon, lat);
-                      const sx = wxToSx(wPt.x);
-                      const sy = wyToSy(wPt.y);
-                      if (i === 0) ctx.moveTo(sx, sy);
-                      else ctx.lineTo(sx, sy);
-                    });
+                    if (
+                      !traceClippedGeoPolyline(
+                        ctx,
+                        line,
+                        geoToGlobalWorld,
+                        wxToSx,
+                        wyToSy,
+                        width,
+                        height,
+                        false
+                      )
+                    ) {
+                      continue;
+                    }
                     if (isCoast) {
                       ctx.strokeStyle = pal.waterStroke;
                       ctx.lineWidth = 1.15;
                       ctx.stroke();
                     } else {
                       ctx.strokeStyle = pal.borderOuter;
-                      ctx.lineWidth = 3.6;
+                      ctx.lineWidth = 1.7;
                       ctx.stroke();
                       ctx.strokeStyle = pal.borderInner;
-                      ctx.lineWidth = 1.65;
+                      ctx.lineWidth = 0.85;
                       ctx.stroke();
                     }
                   }
@@ -1406,29 +2174,28 @@ export const CzechMapCanvas = forwardRef<
               }
             }
 
-            // 2) Draw meter-accurate OSM international (level 2), regional (level 4), and district (level 6) borders
-            if (worldHasOsm) {
-              renderOsmBorders(worldOsmTiles, worldOsmRc, {
-                drawCountryBorders: layers.borders,
-                drawRegionalBorders: layers.districts,
-              });
-            } else if (layers.borders && overlapsCz && realDataset) {
-              // Fallback official Czech border while OSM tile loads
+            // 2) Fallback official Czech border while OSM tile loads (OSM overlay bitmap paints crisp borders on pass 6W)
+            if (!worldHasOsm && layers.borders && overlapsCz && realDataset) {
               ctx.beginPath();
-              realDataset.admin.border.forEach(([lon, lat], idx) => {
-                const wPt = geoToGlobalWorld(lon, lat);
-                const sx = wxToSx(wPt.x);
-                const sy = wyToSy(wPt.y);
-                if (idx === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
-              });
-              ctx.closePath();
-              ctx.strokeStyle = pal.borderOuter;
-              ctx.lineWidth = 4.0;
-              ctx.stroke();
-              ctx.strokeStyle = pal.borderInner;
-              ctx.lineWidth = 1.75;
-              ctx.stroke();
+              if (
+                traceClippedGeoPolyline(
+                  ctx,
+                  realDataset.admin.border,
+                  geoToGlobalWorld,
+                  wxToSx,
+                  wyToSy,
+                  width,
+                  height,
+                  true
+                )
+              ) {
+                ctx.strokeStyle = pal.borderOuter;
+                ctx.lineWidth = 1.8;
+                ctx.stroke();
+                ctx.strokeStyle = pal.borderInner;
+                ctx.lineWidth = 0.9;
+                ctx.stroke();
+              }
             }
           } else if (layers.borders && worldDataset) {
             // Coarse 50m overview country borders (shown ONLY when scale > 1 : 3 000 000)
@@ -1438,23 +2205,29 @@ export const CzechMapCanvas = forwardRef<
               for (const ring of country.rings) {
                 if (ring.length < 3) continue;
                 ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.closePath();
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    ring,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    true
+                  )
+                ) {
+                  continue;
+                }
                 if (isCz) {
-                  ctx.strokeStyle = '#1E5631';
-                  ctx.lineWidth = cam.zoom >= 0.0002 ? 2.2 : 1.5;
+                  ctx.strokeStyle = pal.borderInner;
+                  ctx.lineWidth = cam.zoom >= 0.0002 ? 1.1 : 0.8;
                   ctx.stroke();
                 } else {
                   ctx.strokeStyle = pal.isDark
-                    ? 'rgba(203, 213, 225, 0.36)'
-                    : 'rgba(54, 50, 45, 0.44)';
-                  ctx.lineWidth = cam.zoom >= 0.0002 ? 1.15 : 0.75;
+                    ? 'rgba(148, 163, 184, 0.58)'
+                    : 'rgba(24, 28, 24, 0.68)';
+                  ctx.lineWidth = cam.zoom >= 0.0002 ? 0.82 : 0.6;
                   ctx.stroke();
                 }
               }
@@ -1463,11 +2236,14 @@ export const CzechMapCanvas = forwardRef<
           ctx.restore();
         }
 
-        // 6W. Global Hydrology (50m overview -> OSM full river/stream/lake/pond detail at <= 1 : 3 000 000)
-        if (layers.hydrology) {
-          if (isDetailScale && worldHasOsm) {
-            renderOsmHydrology(worldOsmTiles, worldOsmRc);
-          } else if (isDetailScale && loadedBlocks.length > 0) {
+        // 5bW. Composite Pre-Rasterized OSM Overlay Bitmaps (Water, Waterways, Aeroways, Railways, Roads & Borders)
+        if (isDetailScale && worldHasOsm) {
+          renderOsmOverlayBitmaps(worldOsmTiles, worldOsmRc);
+        }
+
+        // 6W. Global Hydrology fallback (50m overview or block vectors while OSM tiles load)
+        if (layers.hydrology && (!isDetailScale || !worldHasOsm)) {
+          if (isDetailScale && loadedBlocks.length > 0) {
             for (const blk of loadedBlocks) {
               for (const lake of blk.lakes) {
                 if (!bboxVisible(lake.b)) continue;
@@ -1534,68 +2310,39 @@ export const CzechMapCanvas = forwardRef<
 
             ctx.lineCap = 'round';
             ctx.lineJoin = 'round';
-            const labeledRivers = new Set<string>();
             for (const blk of loadedBlocks) {
               for (const river of blk.rivers) {
                 if (!bboxVisible(river.b)) continue;
-                const wScale = Math.max(1.0, Math.min(3.2, river.w * 2.1));
+                const wScale = Math.max(0.85, Math.min(2.2, river.w * 1.55));
                 for (const line of river.l) {
                   if (line.length < 2) continue;
                   ctx.beginPath();
-                  const sPts: Point2D[] = [];
-                  line.forEach(([lon, lat], i) => {
-                    const wPt = geoToGlobalWorld(lon, lat);
-                    const sx = wxToSx(wPt.x);
-                    const sy = wyToSy(wPt.y);
-                    sPts.push({ x: sx, y: sy });
-                    if (i === 0) ctx.moveTo(sx, sy);
-                    else ctx.lineTo(sx, sy);
-                  });
+                  if (
+                    !traceClippedGeoPolyline(
+                      ctx,
+                      line,
+                      geoToGlobalWorld,
+                      wxToSx,
+                      wyToSy,
+                      width,
+                      height,
+                      false
+                    )
+                  ) {
+                    continue;
+                  }
                   ctx.strokeStyle = pal.waterStroke;
                   ctx.lineWidth = Math.max(
-                    1.1,
-                    wScale * (0.58 + Math.min(2.8, cam.zoom * 165))
+                    0.75,
+                    wScale * (0.42 + Math.min(1.8, cam.zoom * 115))
                   );
                   ctx.stroke();
                   ctx.strokeStyle = pal.waterFill;
                   ctx.lineWidth = Math.max(
-                    0.6,
-                    wScale * (0.3 + Math.min(1.6, cam.zoom * 95))
+                    0.4,
+                    wScale * (0.22 + Math.min(1.0, cam.zoom * 65))
                   );
                   ctx.stroke();
-
-                  if (
-                    river.n &&
-                    !labeledRivers.has(river.n) &&
-                    sPts.length >= 4
-                  ) {
-                    const mid = Math.floor(sPts.length * 0.5);
-                    const pA = sPts[mid];
-                    const pB = sPts[Math.min(sPts.length - 1, mid + 1)];
-                    if (
-                      pA.x > 35 &&
-                      pA.x < width - 35 &&
-                      pA.y > 35 &&
-                      pA.y < height - 35
-                    ) {
-                      labeledRivers.add(river.n);
-                      let ang = Math.atan2(pB.y - pA.y, pB.x - pA.x);
-                      if (ang > Math.PI / 2 || ang < -Math.PI / 2)
-                        ang += Math.PI;
-                      ctx.save();
-                      ctx.translate((pA.x + pB.x) / 2, (pA.y + pB.y) / 2 - 6);
-                      ctx.rotate(ang);
-                      ctx.font =
-                        'italic 600 10.5px "Plus Jakarta Sans", sans-serif';
-                      ctx.textAlign = 'center';
-                      ctx.lineWidth = 2.8;
-                      ctx.strokeStyle = pal.textHalo;
-                      ctx.strokeText(river.n, 0, 0);
-                      ctx.fillStyle = pal.waterStroke;
-                      ctx.fillText(river.n, 0, 0);
-                      ctx.restore();
-                    }
-                  }
                 }
               }
             }
@@ -1603,21 +2350,31 @@ export const CzechMapCanvas = forwardRef<
             if (overlapsCz) {
               for (const river of CZECH_RIVERS) {
                 if (!SUPPLEMENTAL_RIVER_IDS.has(river.id)) continue;
-                const sPts = river.points.map(([lon, lat]) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  return { x: wxToSx(wPt.x), y: wyToSy(wPt.y) };
-                });
-                drawSmoothPoints(ctx, sPts);
+                ctx.beginPath();
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    river.points,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.strokeStyle = pal.waterStroke;
                 ctx.lineWidth = Math.max(
-                  1.1,
-                  river.width * (0.58 + Math.min(2.6, cam.zoom * 165))
+                  0.75,
+                  river.width * (0.42 + Math.min(1.7, cam.zoom * 115))
                 );
                 ctx.stroke();
                 ctx.strokeStyle = pal.waterFill;
                 ctx.lineWidth = Math.max(
-                  0.6,
-                  river.width * (0.3 + Math.min(1.5, cam.zoom * 95))
+                  0.4,
+                  river.width * (0.22 + Math.min(0.95, cam.zoom * 65))
                 );
                 ctx.stroke();
               }
@@ -1639,70 +2396,41 @@ export const CzechMapCanvas = forwardRef<
                 ctx.fillStyle = pal.waterFill;
                 ctx.fill();
                 ctx.strokeStyle = pal.waterStroke;
-                ctx.lineWidth = 0.7;
+                ctx.lineWidth = 0.55;
                 ctx.stroke();
               }
             }
 
             ctx.lineCap = 'round';
             ctx.lineJoin = 'round';
-            const labeledWorldRivers = new Set<string>();
             for (const river of worldDataset.rivers) {
               if (river.b && !bboxVisible(river.b)) continue;
               if (cam.zoom < 0.00005 && river.w < 0.75) continue;
               if (cam.zoom < 0.00012 && river.w < 0.45) continue;
-              const wScale = Math.max(0.8, Math.min(2.6, river.w * 1.4));
+              const wScale = Math.max(0.65, Math.min(1.9, river.w * 1.1));
               for (const line of river.lines) {
                 if (line.length < 2) continue;
                 ctx.beginPath();
-                const sPts: Point2D[] = [];
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  sPts.push({ x: sx, y: sy });
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.strokeStyle = pal.waterStroke;
                 ctx.lineWidth = Math.max(
-                  0.75,
-                  wScale * (0.65 + Math.min(1.8, cam.zoom * 3200))
+                  0.55,
+                  wScale * (0.48 + Math.min(1.25, cam.zoom * 2200))
                 );
                 ctx.stroke();
-
-                if (
-                  river.n &&
-                  !labeledWorldRivers.has(river.n) &&
-                  sPts.length >= 4 &&
-                  cam.zoom >= 0.00014
-                ) {
-                  const mid = Math.floor(sPts.length * 0.5);
-                  const pA = sPts[mid];
-                  const pB = sPts[Math.min(sPts.length - 1, mid + 1)];
-                  if (
-                    pA.x > 40 &&
-                    pA.x < width - 40 &&
-                    pA.y > 40 &&
-                    pA.y < height - 40
-                  ) {
-                    labeledWorldRivers.add(river.n);
-                    let ang = Math.atan2(pB.y - pA.y, pB.x - pA.x);
-                    if (ang > Math.PI / 2 || ang < -Math.PI / 2) ang += Math.PI;
-                    ctx.save();
-                    ctx.translate((pA.x + pB.x) / 2, (pA.y + pB.y) / 2 - 5);
-                    ctx.rotate(ang);
-                    ctx.font =
-                      'italic 600 9.5px "Plus Jakarta Sans", sans-serif';
-                    ctx.textAlign = 'center';
-                    ctx.lineWidth = 2.5;
-                    ctx.strokeStyle = pal.textHalo;
-                    ctx.strokeText(river.n, 0, 0);
-                    ctx.fillStyle = pal.waterStroke;
-                    ctx.fillText(river.n, 0, 0);
-                    ctx.restore();
-                  }
-                }
               }
             }
           }
@@ -1723,31 +2451,23 @@ export const CzechMapCanvas = forwardRef<
             for (const u of blk.urban) {
               if (!bboxVisible(u.b)) continue;
               for (const ring of u.g) {
-                ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
+                const screenRing = ring.map(([lon, lat]) => {
                   const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
+                  return { x: wxToSx(wPt.x), y: wyToSy(wPt.y) };
                 });
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
-              }
-            }
-          }
-          if (overlapsCz && realDataset) {
-            for (const u of realDataset.vectors.urban) {
-              for (const ring of u.rings) {
+                const clipped = clipPolygonToRect(
+                  screenRing,
+                  -16,
+                  -16,
+                  width + 16,
+                  height + 16
+                );
+                if (clipped.length < 3) continue;
                 ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                ctx.moveTo(clipped[0].x, clipped[0].y);
+                for (let i = 1; i < clipped.length; i++) {
+                  ctx.lineTo(clipped[i].x, clipped[i].y);
+                }
                 ctx.closePath();
                 ctx.fill();
                 ctx.stroke();
@@ -1755,11 +2475,6 @@ export const CzechMapCanvas = forwardRef<
             }
           }
           ctx.restore();
-        }
-
-        // 7W. Global OSM Transport Network (Aeroways, Railways, Full Road Hierarchy, Shields & Street Names)
-        if (isDetailScale && worldHasOsm) {
-          renderOsmTransport(worldOsmTiles, worldOsmRc);
         }
 
         // 7aW. Global Railway Network fallback (while OSM tiles load)
@@ -1774,13 +2489,20 @@ export const CzechMapCanvas = forwardRef<
               for (const line of rail.l) {
                 if (line.length < 2) continue;
                 ctx.beginPath();
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.setLineDash([]);
                 ctx.strokeStyle = pal.isDark
                   ? 'rgba(148, 163, 184, 0.55)'
@@ -1801,13 +2523,20 @@ export const CzechMapCanvas = forwardRef<
               for (const line of rail.lines) {
                 if (line.length < 2) continue;
                 ctx.beginPath();
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.setLineDash([]);
                 ctx.strokeStyle = pal.isDark
                   ? 'rgba(148, 163, 184, 0.55)'
@@ -1846,61 +2575,75 @@ export const CzechMapCanvas = forwardRef<
               const isSec = rd.t === 1;
               for (const line of rd.l) {
                 ctx.beginPath();
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.strokeStyle = pal.isDark
                   ? 'rgba(148, 163, 184, 0.45)'
                   : isSec
-                    ? 'rgba(146, 108, 68, 0.65)'
-                    : 'rgba(148, 134, 112, 0.42)';
+                    ? 'rgba(198, 126, 28, 0.76)'
+                    : 'rgba(202, 142, 46, 0.66)';
                 ctx.lineWidth = isSec
                   ? cam.zoom >= 0.006
-                    ? 2.8
-                    : 1.8
+                    ? 1.95
+                    : 1.35
                   : cam.zoom >= 0.006
-                    ? 1.9
-                    : 1.1;
+                    ? 1.4
+                    : 0.9;
                 ctx.stroke();
 
                 ctx.strokeStyle = pal.isDark
                   ? '#475569'
                   : isSec
-                    ? '#FEF08A'
-                    : '#FAF5E4';
+                    ? '#F7AC38'
+                    : '#F9C75E';
                 ctx.lineWidth = isSec
                   ? cam.zoom >= 0.006
-                    ? 1.4
-                    : 0.9
+                    ? 1.1
+                    : 0.75
                   : cam.zoom >= 0.006
-                    ? 0.95
-                    : 0.55;
+                    ? 0.75
+                    : 0.48;
                 ctx.stroke();
               }
             }
 
-            // Pass 2: Major Highways / Motorways
+            // Pass 2: Major Highways / Motorways (Mapy.com green motorways)
             for (const rd of blk.roads) {
               if (rd.t !== 2) continue;
               if (!bboxVisible(rd.b)) continue;
               for (const line of rd.l) {
                 ctx.beginPath();
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToGlobalWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToGlobalWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.strokeStyle = pal.highwayCasing;
-                ctx.lineWidth = cam.zoom >= 0.004 ? 4.0 : 2.6;
+                ctx.lineWidth = cam.zoom >= 0.004 ? 2.45 : 1.68;
                 ctx.stroke();
                 ctx.strokeStyle = pal.highwayCore;
-                ctx.lineWidth = cam.zoom >= 0.004 ? 1.9 : 1.25;
+                ctx.lineWidth = cam.zoom >= 0.004 ? 1.38 : 0.92;
                 ctx.stroke();
 
                 if (
@@ -1935,8 +2678,8 @@ export const CzechMapCanvas = forwardRef<
             const bh = 14;
             ctx.fillStyle = pal.highwayBadgeBg;
             ctx.fillRect(b.x - bw / 2, b.y - bh / 2, bw, bh);
-            ctx.strokeStyle = '#FFFFFF';
-            ctx.lineWidth = 0.85;
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+            ctx.lineWidth = 0.9;
             ctx.strokeRect(b.x - bw / 2, b.y - bh / 2, bw, bh);
             ctx.fillStyle = '#FFFFFF';
             ctx.font = '700 8px "JetBrains Mono", monospace';
@@ -1957,10 +2700,10 @@ export const CzechMapCanvas = forwardRef<
                 const isPrimary = hw.roadType === 'primary';
                 const bw = isPrimary ? 28 : 24;
                 const bh = isPrimary ? 13 : 14;
-                ctx.fillStyle = isPrimary ? '#1D4ED8' : pal.highwayBadgeBg;
+                ctx.fillStyle = isPrimary ? '#3E82B8' : pal.highwayBadgeBg;
                 ctx.fillRect(mx - bw / 2, my - bh / 2, bw, bh);
                 ctx.strokeStyle = '#FFFFFF';
-                ctx.lineWidth = 0.85;
+                ctx.lineWidth = 0.9;
                 ctx.strokeRect(mx - bw / 2, my - bh / 2, bw, bh);
                 ctx.fillStyle = '#FFFFFF';
                 ctx.font = `700 ${isPrimary ? '8' : '8.5'}px "JetBrains Mono", monospace`;
@@ -2001,48 +2744,60 @@ export const CzechMapCanvas = forwardRef<
 
             const isCap = tier === 2;
             const isReg = tier === 1;
+            const isVillage = !isOverview && !isCap && !isReg && pop < 3200;
+            const isLocality = !isOverview && !isCap && !isReg && pop < 400;
             const r = isOverview
               ? isCap
                 ? cam.zoom >= 0.00012
-                  ? 4.0
-                  : 3.1
+                  ? 3.1
+                  : 2.5
                 : pop >= 3000000
-                  ? 3.2
-                  : 2.3
+                  ? 2.5
+                  : 1.9
               : isCap
-                ? 5.0
+                ? 3.6
                 : isReg
-                  ? 3.7
-                  : pop >= 100000
-                    ? 3.1
-                    : pop >= 25000
-                      ? 2.4
-                      : 1.9;
+                  ? 2.8
+                  : pop >= 80000
+                    ? 2.4
+                    : pop >= 15000
+                      ? 2.0
+                      : pop >= 3200
+                        ? 1.75
+                        : 1.35;
 
             ctx.font = isOverview
               ? isCap
-                ? '700 10.5px "Plus Jakarta Sans", sans-serif'
-                : '500 9.5px "Plus Jakarta Sans", sans-serif'
+                ? '700 10.2px "Plus Jakarta Sans", sans-serif'
+                : '500 9.2px "Plus Jakarta Sans", sans-serif'
               : isCap
-                ? '700 12.5px "Outfit", sans-serif'
+                ? '700 12.2px "Plus Jakarta Sans", sans-serif'
                 : isReg
-                  ? '700 10.8px "Plus Jakarta Sans", sans-serif'
-                  : pop >= 45000
-                    ? '600 10.2px "Plus Jakarta Sans", sans-serif'
-                    : '500 9.4px "Plus Jakarta Sans", sans-serif';
+                  ? '600 10.8px "Plus Jakarta Sans", sans-serif'
+                  : pop >= 35000
+                    ? '600 10px "Plus Jakarta Sans", sans-serif'
+                    : pop >= 3200
+                      ? '500 9.3px "Plus Jakarta Sans", sans-serif'
+                      : isLocality
+                        ? '500 8.3px "Plus Jakarta Sans", sans-serif'
+                        : '500 8.8px "Plus Jakarta Sans", sans-serif';
 
-            const tw = ctx.measureText(name).width;
-            const lx = sx + r + 4.5;
-            const ly = sy;
-            const boxH = isCap ? 15 : 13;
+            const displayLabel =
+              !isOverview && isCap ? name.toUpperCase() : name;
+            const tw = ctx.measureText(displayLabel).width;
+            const boxH = isCap ? 14 : isLocality ? 10 : 12;
+            const lx = sx;
+            const ly = isLocality
+              ? sy
+              : sy - r - boxH * 0.45 - 1.4;
 
-            // Reserve bounding box covering both the city dot and its text label
+            // Reserve bounding box covering both the city dot and its centered label above
             if (
               !tryPlaceBox(
-                sx - r - 3,
+                sx - Math.max(tw * 0.5 + 3, r + 2),
                 ly - boxH * 0.5,
-                r * 2 + 8 + tw,
-                boxH,
+                Math.max(tw + 6, r * 2 + 4),
+                boxH + (isLocality ? 2 : r * 2 + 3),
                 false
               )
             ) {
@@ -2051,46 +2806,43 @@ export const CzechMapCanvas = forwardRef<
 
             placedCities.push({ x: sx, y: sy });
 
-            ctx.beginPath();
-            ctx.arc(sx, sy, r, 0, Math.PI * 2);
-            ctx.fillStyle = isCap ? '#B91C1C' : pal.cityRing;
-            ctx.fill();
-            ctx.lineWidth = isCap ? 1.8 : 1.25;
-            ctx.strokeStyle = pal.cityDot;
-            ctx.stroke();
-
-            if (!isOverview && isReg) {
+            if (!isLocality) {
               ctx.beginPath();
-              ctx.arc(sx, sy, 1.35, 0, Math.PI * 2);
-              ctx.fillStyle = pal.cityDot;
+              ctx.arc(sx, sy, r, 0, Math.PI * 2);
+              ctx.fillStyle = pal.cityRing;
               ctx.fill();
+              ctx.lineWidth = isCap ? 1.25 : isVillage ? 0.9 : 1.05;
+              ctx.strokeStyle = pal.cityDot;
+              ctx.stroke();
             }
 
-            ctx.textAlign = 'left';
+            ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.lineWidth = 3.0;
+            ctx.lineWidth = isLocality ? 2.5 : 3.0;
             ctx.strokeStyle = pal.textHalo;
-            ctx.strokeText(name, lx, ly);
-            ctx.fillStyle = pal.textPrimary;
-            ctx.fillText(name, lx, ly);
+            ctx.strokeText(displayLabel, lx, ly);
+            ctx.fillStyle = isLocality ? pal.textSecondary : pal.textPrimary;
+            ctx.fillText(displayLabel, lx, ly);
           };
 
           if (isDetailScale && (loadedBlocks.length > 0 || worldHasOsm)) {
-            // Progressive zoom thresholds and spatial spacing at detail scale (<= 1 : 3 000 000)
+            // Progressive zoom thresholds and spatial spacing across all detail zoom levels (osmZ 7..14)
             const minCityDistPx =
-              cam.zoom < 0.0018
-                ? 64
-                : cam.zoom < 0.0028
-                  ? 56
-                  : cam.zoom < 0.0045
-                    ? 50
-                    : cam.zoom < 0.0075
-                      ? 44
-                      : cam.zoom < 0.0125
-                        ? 37
-                        : cam.zoom < 0.022
-                          ? 30
-                          : 23;
+              cam.zoom < 0.0022
+                ? 76
+                : cam.zoom < 0.0042
+                  ? 68
+                  : cam.zoom < 0.0085
+                    ? 60
+                    : cam.zoom < 0.017
+                      ? 54
+                      : cam.zoom < 0.035
+                        ? 48
+                        : cam.zoom < 0.07
+                          ? 44
+                          : cam.zoom < 0.13
+                            ? 40
+                            : 34;
 
             const candidates: {
               x: number;
@@ -2111,19 +2863,21 @@ export const CzechMapCanvas = forwardRef<
                   continue;
                 }
                 const passZoom =
-                  cam.zoom < 0.0018
+                  cam.zoom < 0.0022
                     ? city.t === 2 ||
-                      (city.t === 1 && city.p >= 45000) ||
-                      city.p >= 90000
-                    : cam.zoom < 0.0028
-                      ? city.t >= 1 || city.p >= 42000
-                      : cam.zoom < 0.0045
-                        ? city.t >= 1 || city.p >= 20000
-                        : cam.zoom < 0.0075
+                      (city.t === 1 && city.p >= 60000) ||
+                      city.p >= 110000
+                    : cam.zoom < 0.0042
+                      ? city.t >= 1 || city.p >= 45000
+                      : cam.zoom < 0.0085
+                        ? city.t >= 1 || city.p >= 22000
+                        : cam.zoom < 0.017
                           ? city.t >= 1 || city.p >= 10000
-                          : cam.zoom < 0.0125
-                            ? city.p >= 5000
-                            : true;
+                          : cam.zoom < 0.035
+                            ? city.p >= 3500
+                            : cam.zoom < 0.07
+                              ? city.p >= 1000
+                              : true;
                 if (!passZoom) continue;
                 candidates.push({
                   x: city.x,
@@ -2147,20 +2901,20 @@ export const CzechMapCanvas = forwardRef<
                 }
                 const mappedTier = city.t === 3 ? 2 : city.t === 2 ? 1 : 0;
                 const passZoom =
-                  cam.zoom < 0.0018
+                  cam.zoom < 0.0022
                     ? mappedTier === 2 ||
-                      (mappedTier === 1 && city.p >= 40000) ||
-                      city.p >= 75000
-                    : cam.zoom < 0.0028
-                      ? mappedTier >= 1 || city.p >= 35000
-                      : cam.zoom < 0.0045
-                        ? mappedTier >= 1 || city.p >= 16000
-                        : cam.zoom < 0.0075
-                          ? city.t >= 1 || city.p >= 7500
-                          : cam.zoom < 0.0125
-                            ? city.p >= 3500
-                            : cam.zoom < 0.022
-                              ? city.p >= 1200
+                      (mappedTier === 1 && city.p >= 45000) ||
+                      city.p >= 85000
+                    : cam.zoom < 0.0042
+                      ? mappedTier >= 1 || city.p >= 24000
+                      : cam.zoom < 0.0085
+                        ? mappedTier >= 1 || city.p >= 11000
+                        : cam.zoom < 0.017
+                          ? city.t >= 1 || city.p >= 4800
+                          : cam.zoom < 0.035
+                            ? city.p >= 1800
+                            : cam.zoom < 0.07
+                              ? city.p >= 600
                               : true;
                 if (!passZoom) continue;
                 candidates.push({
@@ -2182,8 +2936,8 @@ export const CzechMapCanvas = forwardRef<
               tryDrawCity(c.x, c.y, c.n, c.p, c.t, minCityDistPx, false);
             }
 
-            // Supplement close zoom (z >= 11) with OSM villages, hamlets & city districts
-            if (worldHasOsm && worldOsmTargetZ >= 11) {
+            // Supplement with OSM towns/villages (and suburbs/hamlets only at z >= 13)
+            if (worldHasOsm && worldOsmTargetZ >= 10) {
               const osmPlaceCandidates: {
                 lon: number;
                 lat: number;
@@ -2192,7 +2946,8 @@ export const CzechMapCanvas = forwardRef<
                 cls: string;
               }[] = [];
               for (const tile of worldOsmTiles) {
-                for (const pl of tile.places) {
+                if (tile.clipBounds) continue;
+                for (const pl of tile.labels.places) {
                   if (
                     pl.lon < viewMinLon ||
                     pl.lon > viewMaxLon ||
@@ -2202,8 +2957,17 @@ export const CzechMapCanvas = forwardRef<
                     continue;
                   }
                   if (
-                    worldOsmTargetZ < 12 &&
-                    (pl.cls === 'hamlet' || pl.cls === 'quarter')
+                    worldOsmTargetZ <= 10 &&
+                    pl.cls !== 'city' &&
+                    pl.cls !== 'town'
+                  ) {
+                    continue;
+                  }
+                  if (
+                    worldOsmTargetZ <= 12 &&
+                    (pl.cls === 'hamlet' ||
+                      pl.cls === 'quarter' ||
+                      pl.cls === 'suburb')
                   ) {
                     continue;
                   }
@@ -2215,13 +2979,23 @@ export const CzechMapCanvas = forwardRef<
               }
               osmPlaceCandidates.sort((a, b) => a.rank - b.rank);
               for (const pl of osmPlaceCandidates) {
+                const isLocality =
+                  pl.cls === 'hamlet' ||
+                  pl.cls === 'quarter' ||
+                  pl.cls === 'suburb';
                 tryDrawCity(
                   pl.lon,
                   pl.lat,
                   pl.name,
-                  pl.cls === 'town' ? 8000 : 800,
+                  pl.cls === 'city'
+                    ? 40000
+                    : pl.cls === 'town'
+                      ? 8000
+                      : isLocality
+                        ? 150
+                        : 1200,
                   0,
-                  Math.max(22, minCityDistPx),
+                  isLocality ? Math.max(46, minCityDistPx) : minCityDistPx,
                   false
                 );
               }
@@ -2272,31 +3046,31 @@ export const CzechMapCanvas = forwardRef<
           }
         }
 
-        // 9W. World Mountain Peaks (Progressive multi-tier LOD & spatial decluttering)
+        // 9W. World Mountain Peaks (Progressive multi-tier LOD & generous spatial decluttering)
         if (layers.peaks && worldDataset) {
           const placedPeaks: { x: number; y: number }[] = [];
 
           const minPeakDistPx = !isDetailScale
             ? cam.zoom < 0.00005
-              ? 105
+              ? 130
               : cam.zoom < 0.00014
-                ? 88
+                ? 115
                 : cam.zoom < 0.00045
-                  ? 74
-                  : 64
-            : cam.zoom < 0.0018
-              ? 90
-              : cam.zoom < 0.0028
-                ? 76
-                : cam.zoom < 0.0045
-                  ? 64
-                  : cam.zoom < 0.0075
-                    ? 52
-                    : cam.zoom < 0.013
-                      ? 42
-                      : cam.zoom < 0.024
-                        ? 32
-                        : 23;
+                  ? 100
+                  : 90
+            : cam.zoom < 0.0025
+              ? 165
+              : cam.zoom < 0.005
+                ? 145
+                : cam.zoom < 0.01
+                  ? 130
+                  : cam.zoom < 0.022
+                    ? 120
+                    : cam.zoom < 0.05
+                      ? 112
+                      : cam.zoom < 0.1
+                        ? 102
+                        : 86;
 
           const drawPeakSymbol = (
             lon: number,
@@ -2310,7 +3084,7 @@ export const CzechMapCanvas = forwardRef<
             if (sx < -20 || sx > width + 20 || sy < -20 || sy > height + 20)
               return;
 
-            // Enforce minimum screen distance between peaks so dominant summits appear first and subordinate peaks fill in gradually
+            // Enforce generous screen distance between peaks so dominant summits stand out cleanly
             for (let i = 0; i < placedPeaks.length; i++) {
               const dx = placedPeaks[i].x - sx;
               const dy = placedPeaks[i].y - sy;
@@ -2318,28 +3092,28 @@ export const CzechMapCanvas = forwardRef<
             }
 
             const label = `${name} ${elev}`;
-            ctx.font = 'italic 600 9.4px "Plus Jakarta Sans", sans-serif';
+            ctx.font = 'italic 500 8.5px "Plus Jakarta Sans", sans-serif';
             const tw = ctx.measureText(label).width;
-            const lx = sx + 6.2;
-            const ly = sy + 1;
-            if (!tryPlaceBox(sx - 5, ly - 6, tw + 13, 12, false)) return;
+            const lx = sx + 4.8;
+            const ly = sy + 0.5;
+            if (!tryPlaceBox(sx - 4, ly - 5.5, tw + 11, 11, false)) return;
 
             placedPeaks.push({ x: sx, y: sy });
 
             ctx.beginPath();
-            ctx.moveTo(sx, sy - 4.5);
-            ctx.lineTo(sx + 3.9, sy + 3.0);
-            ctx.lineTo(sx - 3.9, sy + 3.0);
+            ctx.moveTo(sx, sy - 2.9);
+            ctx.lineTo(sx + 2.5, sy + 1.9);
+            ctx.lineTo(sx - 2.5, sy + 1.9);
             ctx.closePath();
             ctx.fillStyle = pal.peakColor;
             ctx.strokeStyle = pal.textHalo;
-            ctx.lineWidth = 1.4;
+            ctx.lineWidth = 1.05;
             ctx.stroke();
             ctx.fill();
 
             ctx.textAlign = 'left';
             ctx.textBaseline = 'middle';
-            ctx.lineWidth = 2.8;
+            ctx.lineWidth = 2.3;
             ctx.strokeStyle = pal.textHalo;
             ctx.strokeText(label, lx, ly);
             ctx.fillStyle = pal.peakColor;
@@ -2347,6 +3121,21 @@ export const CzechMapCanvas = forwardRef<
           };
 
           if (isDetailScale && (loadedBlocks.length > 0 || worldHasOsm)) {
+            const minElevForDetailZoom =
+              cam.zoom < 0.0025
+                ? 1350
+                : cam.zoom < 0.005
+                  ? 1150
+                  : cam.zoom < 0.01
+                    ? 980
+                    : cam.zoom < 0.022
+                      ? 820
+                      : cam.zoom < 0.05
+                        ? 650
+                        : cam.zoom < 0.1
+                          ? 480
+                          : 260;
+
             const peakCandidates: {
               x: number;
               y: number;
@@ -2358,6 +3147,7 @@ export const CzechMapCanvas = forwardRef<
             for (const blk of loadedBlocks) {
               for (const peak of blk.peaks) {
                 if (
+                  peak.e < minElevForDetailZoom ||
                   peak.x < viewMinLon ||
                   peak.x > viewMaxLon ||
                   peak.y < viewMinLat ||
@@ -2373,6 +3163,7 @@ export const CzechMapCanvas = forwardRef<
             if (overlapsCz && realDataset) {
               for (const peak of realDataset.places.peaks) {
                 if (
+                  peak.e < minElevForDetailZoom ||
                   peak.x < viewMinLon ||
                   peak.x > viewMaxLon ||
                   peak.y < viewMinLat ||
@@ -2387,8 +3178,10 @@ export const CzechMapCanvas = forwardRef<
 
             if (worldHasOsm && worldOsmTargetZ >= 11) {
               for (const tile of worldOsmTiles) {
-                for (const pk of tile.peaks) {
+                if (tile.clipBounds) continue;
+                for (const pk of tile.labels.peaks) {
                   if (
+                    pk.ele < minElevForDetailZoom ||
                     pk.lon < viewMinLon ||
                     pk.lon > viewMaxLon ||
                     pk.lat < viewMinLat ||
@@ -2437,6 +3230,14 @@ export const CzechMapCanvas = forwardRef<
               drawPeakSymbol(peak.x, peak.y, peak.n, peak.e);
             }
           }
+        }
+
+        // 9bW. OSM Water & Transport Labels (placed after cities & peaks so arriving tiles never shift settlement or summit labels)
+        if (isDetailScale && worldHasOsm) {
+          if (layers.hydrology) {
+            renderOsmWaterLabels(worldOsmTiles, worldOsmRc);
+          }
+          renderOsmTransportLabels(worldOsmTiles, worldOsmRc);
         }
 
         // 10W. Country Name Labels
@@ -2493,26 +3294,37 @@ export const CzechMapCanvas = forwardRef<
         // CZECH REPUBLIC HIGH-PRECISION RENDERING PIPELINE (ČESKÁ REPUBLIKA)
         // =====================================================================
         const czTlGeo = worldToGeo(
-          cam.cx - (width * 0.56) / cam.zoom,
-          cam.cy - (height * 0.56) / cam.zoom
+          cam.cx - (width * 0.505) / cam.zoom,
+          cam.cy - (height * 0.505) / cam.zoom
         );
         const czBrGeo = worldToGeo(
-          cam.cx + (width * 0.56) / cam.zoom,
-          cam.cy + (height * 0.56) / cam.zoom
+          cam.cx + (width * 0.505) / cam.zoom,
+          cam.cy + (height * 0.505) / cam.zoom
         );
         const czMinLon = Math.min(czTlGeo.lon, czBrGeo.lon);
         const czMaxLon = Math.max(czTlGeo.lon, czBrGeo.lon);
         const czMinLat = Math.min(czTlGeo.lat, czBrGeo.lat);
         const czMaxLat = Math.max(czTlGeo.lat, czBrGeo.lat);
-        const czOsmTargetZ = pickOsmVectorZoom(czMaxLon - czMinLon, 7, 14);
-        const { tiles: czOsmTiles } = ensureOsmVectorTilesForViewport(
+        const czLevelSpec =
+          zoomLevels[findNearestZoomIndex(zoomLevels, cam.zoom)];
+        const czOsmTargetZ = czLevelSpec?.osmZ ?? 8;
+        const czOsmOpts = buildOsmRenderOptions(
+          stylePreset,
+          layers,
+          pal,
+          layers.borders,
+          layers.districts
+        );
+        const czOsmRes = ensureOsmVectorTilesForViewport(
           czMinLon,
           czMaxLon,
           czMinLat,
           czMaxLat,
           czOsmTargetZ,
-          () => setOsmRevision((v) => v + 1)
+          czOsmOpts,
+          scheduleOsmRedraw
         );
+        const czOsmTiles = czOsmRes.tiles;
         const czHasOsm = czOsmTiles.length > 0;
         const czOsmRc: OsmRenderContext = {
           ctx,
@@ -2529,25 +3341,10 @@ export const CzechMapCanvas = forwardRef<
           tryPlaceBox,
         };
 
-        // 1b. Real OSM Forests, Wetlands, NP/CHKO, Built-up Urban Footprints & Buildings
+        // 1b. Pre-rasterized OSM Base Bitmaps (Forests, Wetlands, NP/CHKO, Built-up Urban & Buildings)
         if (czHasOsm) {
-          renderOsmLandcoverAndUrban(czOsmTiles, czOsmRc);
+          renderOsmBaseBitmaps(czOsmTiles, czOsmRc);
         }
-
-        // 2. Soft cartographic mask outside Czech Republic border
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(0, 0, width, height);
-        borderWorld.forEach((pt, idx) => {
-          const sx = wxToSx(pt.x);
-          const sy = wyToSy(pt.y);
-          if (idx === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        });
-        ctx.closePath();
-        ctx.fillStyle = pal.outsideVeil;
-        ctx.fill('evenodd');
-        ctx.restore();
 
         // 3. WGS84 Graticule (adaptive 1° / 0.5° / 0.25° / 0.1°)
         if (layers.graticule) {
@@ -2608,47 +3405,80 @@ export const CzechMapCanvas = forwardRef<
           const activeContours = useLocalContours
             ? localPatch.patch.contours
             : terrain.contours;
-          const showMinor = useLocalContours || cam.zoom >= 0.0032;
+          const showMinor = useLocalContours || cam.zoom >= 0.008;
+          ctx.save();
+          if (cam.zoom < 0.015) {
+            ctx.globalAlpha = cam.zoom < 0.007 ? 0.32 : 0.55;
+          }
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
 
           if (showMinor) {
             ctx.strokeStyle = pal.contourMinor;
-            ctx.lineWidth = 0.45;
+            ctx.lineWidth = 0.42;
+            let segCount = 0;
             ctx.beginPath();
             for (const level of activeContours) {
               if (level.isIndex) continue;
               for (const poly of level.polylines) {
-                for (let i = 0; i < poly.length; i++) {
-                  const sx = wxToSx(poly[i].x);
-                  const sy = wyToSy(poly[i].y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
+                if (
+                  traceClippedWorldPolyline(
+                    ctx,
+                    poly,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  segCount += poly.length;
+                  if (segCount >= 3500) {
+                    ctx.stroke();
+                    ctx.beginPath();
+                    segCount = 0;
+                  }
                 }
               }
             }
-            ctx.stroke();
+            if (segCount > 0) ctx.stroke();
           }
 
           ctx.strokeStyle = pal.contourIndex;
-          ctx.lineWidth = cam.zoom >= 0.004 ? 0.8 : 0.62;
-          ctx.beginPath();
-          for (const level of activeContours) {
-            if (!level.isIndex) continue;
-            for (const poly of level.polylines) {
-              for (let i = 0; i < poly.length; i++) {
-                const sx = wxToSx(poly[i].x);
-                const sy = wyToSy(poly[i].y);
-                if (i === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
+          ctx.lineWidth = cam.zoom >= 0.01 ? 0.72 : 0.52;
+          {
+            let segCount = 0;
+            ctx.beginPath();
+            for (const level of activeContours) {
+              if (!level.isIndex) continue;
+              for (const poly of level.polylines) {
+                if (
+                  traceClippedWorldPolyline(
+                    ctx,
+                    poly,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  segCount += poly.length;
+                  if (segCount >= 3500) {
+                    ctx.stroke();
+                    ctx.beginPath();
+                    segCount = 0;
+                  }
+                }
               }
             }
+            if (segCount > 0) ctx.stroke();
           }
-          ctx.stroke();
+          ctx.restore();
 
-          // Inline contour elevation numbers when zoomed in
-          if (cam.zoom >= 0.0034) {
-            ctx.font = '500 9px "JetBrains Mono", monospace';
+          // Inline contour elevation numbers only at close tourist zoom
+          if (cam.zoom >= 0.028) {
+            ctx.font = '500 8.5px "JetBrains Mono", monospace';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             for (const level of activeContours) {
@@ -2667,7 +3497,7 @@ export const CzechMapCanvas = forwardRef<
                 ctx.save();
                 ctx.translate(sx, sy);
                 ctx.rotate(ang);
-                ctx.lineWidth = 3;
+                ctx.lineWidth = 2.6;
                 ctx.strokeStyle = pal.contourHalo;
                 ctx.strokeText(`${level.elevation}`, 0, 0);
                 ctx.fillStyle = pal.contourIndex;
@@ -2678,7 +3508,7 @@ export const CzechMapCanvas = forwardRef<
           }
         }
 
-        // 5. Administrative Borders: Okresy (77), Kraje (14), and National Border
+        // 5. Administrative Borders: Okresy (77), Kraje (14), and National Border fallback
         if (layers.districts && realDataset) {
           ctx.save();
           ctx.strokeStyle = pal.isDark
@@ -2689,239 +3519,180 @@ export const CzechMapCanvas = forwardRef<
           for (const okr of realDataset.admin.okresy) {
             for (const ring of okr.rings) {
               ctx.beginPath();
-              ring.forEach(([lon, lat], i) => {
-                const wPt = geoToWorld(lon, lat);
-                const sx = wxToSx(wPt.x);
-                const sy = wyToSy(wPt.y);
-                if (i === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
-              });
-              ctx.closePath();
-              ctx.stroke();
+              if (
+                traceClippedGeoPolyline(
+                  ctx,
+                  ring,
+                  geoToWorld,
+                  wxToSx,
+                  wyToSy,
+                  width,
+                  height,
+                  true
+                )
+              ) {
+                ctx.stroke();
+              }
             }
           }
-          ctx.restore();
-        }
-
-        if (layers.borders) {
-          ctx.save();
-          ctx.strokeStyle = pal.regionBorder;
-          ctx.lineWidth = 1.05;
-          ctx.setLineDash([4, 4]);
-          if (realDataset) {
+          if (!czHasOsm) {
+            ctx.strokeStyle = pal.regionBorder;
+            ctx.lineWidth = 0.85;
+            ctx.setLineDash([4, 4]);
             for (const kraj of realDataset.admin.kraje) {
               for (const ring of kraj.rings) {
                 ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.closePath();
-                ctx.stroke();
-              }
-            }
-          } else {
-            for (const line of CZECH_REGION_LINES) {
-              ctx.beginPath();
-              line.forEach(([lon, lat], i) => {
-                const wPt = geoToWorld(lon, lat);
-                const sx = wxToSx(wPt.x);
-                const sy = wyToSy(wPt.y);
-                if (i === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
-              });
-              ctx.stroke();
-            }
-          }
-          ctx.restore();
-
-          // National Border (Státní hranice ČR)
-          ctx.save();
-          ctx.beginPath();
-          borderWorld.forEach((pt, idx) => {
-            const sx = wxToSx(pt.x);
-            const sy = wyToSy(pt.y);
-            if (idx === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-          });
-          ctx.closePath();
-          ctx.lineJoin = 'round';
-          ctx.strokeStyle = pal.borderOuter;
-          ctx.lineWidth = 4.2;
-          ctx.stroke();
-
-          ctx.strokeStyle = pal.borderInner;
-          ctx.lineWidth = 1.7;
-          ctx.stroke();
-          ctx.restore();
-        }
-
-        // 6. Hydrology: OSM Rivers, Streams, Reservoirs & Ponds (with fallback while loading)
-        if (layers.hydrology) {
-          if (czHasOsm) {
-            renderOsmHydrology(czOsmTiles, czOsmRc);
-          } else {
-          if (realDataset) {
-            for (const lake of realDataset.vectors.lakes) {
-              for (const ring of lake.rings) {
-                ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.closePath();
-                ctx.fillStyle = pal.waterFill;
-                ctx.fill();
-                ctx.strokeStyle = pal.waterStroke;
-                ctx.lineWidth = 1.0;
-                ctx.stroke();
-              }
-            }
-          }
-
-          for (const lake of CZECH_LAKES) {
-            ctx.beginPath();
-            lake.points.forEach(([lon, lat], i) => {
-              const wPt = geoToWorld(lon, lat);
-              const sx = wxToSx(wPt.x);
-              const sy = wyToSy(wPt.y);
-              if (i === 0) ctx.moveTo(sx, sy);
-              else ctx.lineTo(sx, sy);
-            });
-            ctx.closePath();
-            ctx.fillStyle = pal.waterFill;
-            ctx.fill();
-            ctx.strokeStyle = pal.waterStroke;
-            ctx.lineWidth = 1.1;
-            ctx.stroke();
-
-            if (cam.zoom >= 0.0022) {
-              const avgLon =
-                lake.points.reduce((a, b) => a + b[0], 0) / lake.points.length;
-              const avgLat =
-                lake.points.reduce((a, b) => a + b[1], 0) / lake.points.length;
-              const cPt = geoToWorld(avgLon, avgLat);
-              const sx = wxToSx(cPt.x);
-              const sy = wyToSy(cPt.y);
-              ctx.font = 'italic 500 10px "Plus Jakarta Sans", sans-serif';
-              ctx.textAlign = 'center';
-              ctx.lineWidth = 2.8;
-              ctx.strokeStyle = pal.textHalo;
-              ctx.strokeText(lake.name, sx, sy - 8);
-              ctx.fillStyle = pal.waterStroke;
-              ctx.fillText(lake.name, sx, sy - 8);
-            }
-          }
-
-          if (realDataset) {
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
-            const labeledRivers = new Set<string>();
-            for (const river of realDataset.vectors.rivers) {
-              const wScale = Math.max(1.0, Math.min(3.2, river.w * 2.1));
-              for (const line of river.lines) {
-                if (line.length < 2) continue;
-                ctx.beginPath();
-                const sPts: Point2D[] = [];
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  sPts.push({ x: sx, y: sy });
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.strokeStyle = pal.waterStroke;
-                ctx.lineWidth = Math.max(1.1, wScale * (0.58 + cam.zoom * 165));
-                ctx.stroke();
-                ctx.strokeStyle = pal.waterFill;
-                ctx.lineWidth = Math.max(0.6, wScale * (0.3 + cam.zoom * 95));
-                ctx.stroke();
-
                 if (
-                  river.name &&
-                  !labeledRivers.has(river.name) &&
-                  sPts.length >= 4 &&
-                  (wScale >= 1.5 || cam.zoom >= 0.0028)
+                  traceClippedGeoPolyline(
+                    ctx,
+                    ring,
+                    geoToWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    true
+                  )
                 ) {
-                  const mid = Math.floor(sPts.length * 0.5);
-                  const pA = sPts[mid];
-                  const pB = sPts[Math.min(sPts.length - 1, mid + 1)];
-                  if (
-                    pA.x > 30 &&
-                    pA.x < width - 30 &&
-                    pA.y > 30 &&
-                    pA.y < height - 30
-                  ) {
-                    labeledRivers.add(river.name);
-                    let ang = Math.atan2(pB.y - pA.y, pB.x - pA.x);
-                    if (ang > Math.PI / 2 || ang < -Math.PI / 2) ang += Math.PI;
-                    ctx.save();
-                    ctx.translate((pA.x + pB.x) / 2, (pA.y + pB.y) / 2 - 6);
-                    ctx.rotate(ang);
-                    ctx.font =
-                      'italic 600 10.5px "Plus Jakarta Sans", sans-serif';
-                    ctx.textAlign = 'center';
-                    ctx.lineWidth = 2.8;
-                    ctx.strokeStyle = pal.textHalo;
-                    ctx.strokeText(river.name, 0, 0);
-                    ctx.fillStyle = pal.waterStroke;
-                    ctx.fillText(river.name, 0, 0);
-                    ctx.restore();
-                  }
+                  ctx.stroke();
                 }
               }
             }
           }
+          ctx.restore();
+        }
 
-          // Draw supplemental Czech rivers (or all fallback rivers if dataset still loading)
-          for (const river of CZECH_RIVERS) {
-            if (realDataset && !SUPPLEMENTAL_RIVER_IDS.has(river.id)) continue;
-            const sPts = river.points.map(([lon, lat]) => {
-              const wPt = geoToWorld(lon, lat);
-              return { x: wxToSx(wPt.x), y: wyToSy(wPt.y) };
-            });
-            drawSmoothPoints(ctx, sPts);
-            ctx.lineCap = 'round';
+        if (layers.borders && !czHasOsm) {
+          // Fallback National Border while OSM tiles load
+          ctx.save();
+          ctx.beginPath();
+          if (
+            traceClippedWorldPolyline(
+              ctx,
+              borderWorld,
+              wxToSx,
+              wyToSy,
+              width,
+              height,
+              true
+            )
+          ) {
             ctx.lineJoin = 'round';
-            ctx.strokeStyle = pal.waterStroke;
-            ctx.lineWidth = Math.max(
-              1.1,
-              river.width * (0.58 + cam.zoom * 165)
-            );
-            ctx.stroke();
-            ctx.strokeStyle = pal.waterFill;
-            ctx.lineWidth = Math.max(0.6, river.width * (0.3 + cam.zoom * 95));
+            ctx.strokeStyle = pal.borderOuter;
+            ctx.lineWidth = 1.8;
             ctx.stroke();
 
-            if (
-              (river.width >= 1.7 || cam.zoom >= 0.0028) &&
-              sPts.length >= 3
-            ) {
-              const mid = Math.floor(sPts.length * 0.52);
-              const pA = sPts[mid];
-              const pB = sPts[Math.min(sPts.length - 1, mid + 1)];
-              let ang = Math.atan2(pB.y - pA.y, pB.x - pA.x);
-              if (ang > Math.PI / 2 || ang < -Math.PI / 2) ang += Math.PI;
-              ctx.save();
-              ctx.translate((pA.x + pB.x) / 2, (pA.y + pB.y) / 2 - 6);
-              ctx.rotate(ang);
-              ctx.font = 'italic 600 10.5px "Plus Jakarta Sans", sans-serif';
-              ctx.textAlign = 'center';
-              ctx.lineWidth = 2.8;
-              ctx.strokeStyle = pal.textHalo;
-              ctx.strokeText(river.name, 0, 0);
-              ctx.fillStyle = pal.waterStroke;
-              ctx.fillText(river.name, 0, 0);
-              ctx.restore();
-            }
+            ctx.strokeStyle = pal.borderInner;
+            ctx.lineWidth = 0.9;
+            ctx.stroke();
           }
+          ctx.restore();
+        }
+
+        // 5b. Composite Pre-Rasterized OSM Overlay Bitmaps (Water, Waterways, Aeroways, Railways & Roads)
+        if (czHasOsm) {
+          renderOsmOverlayBitmaps(czOsmTiles, czOsmRc);
+        }
+
+        // 6. Hydrology fallback (viewport-clipped geometry while OSM tiles load)
+        if (layers.hydrology && !czHasOsm) {
+          {
+            for (const lake of CZECH_LAKES) {
+              const screenRing = lake.points.map(([lon, lat]) => {
+                const wPt = geoToWorld(lon, lat);
+                return { x: wxToSx(wPt.x), y: wyToSy(wPt.y) };
+              });
+              const clipped = clipPolygonToRect(
+                screenRing,
+                -16,
+                -16,
+                width + 16,
+                height + 16
+              );
+              if (clipped.length < 3) continue;
+              ctx.beginPath();
+              ctx.moveTo(clipped[0].x, clipped[0].y);
+              for (let i = 1; i < clipped.length; i++) {
+                ctx.lineTo(clipped[i].x, clipped[i].y);
+              }
+              ctx.closePath();
+              ctx.fillStyle = pal.waterFill;
+              ctx.fill();
+              ctx.strokeStyle = pal.waterStroke;
+              ctx.lineWidth = 0.75;
+              ctx.stroke();
+            }
+
+            if (realDataset) {
+              ctx.lineCap = 'round';
+              ctx.lineJoin = 'round';
+              for (const river of realDataset.vectors.rivers) {
+                const wScale = Math.max(0.85, Math.min(2.2, river.w * 1.55));
+                for (const line of river.lines) {
+                  if (line.length < 2) continue;
+                  ctx.beginPath();
+                  if (
+                    !traceClippedGeoPolyline(
+                      ctx,
+                      line,
+                      geoToWorld,
+                      wxToSx,
+                      wyToSy,
+                      width,
+                      height,
+                      false
+                    )
+                  ) {
+                    continue;
+                  }
+                  ctx.strokeStyle = pal.waterStroke;
+                  ctx.lineWidth = Math.max(
+                    0.75,
+                    wScale * (0.42 + Math.min(1.75, cam.zoom * 115))
+                  );
+                  ctx.stroke();
+                  ctx.strokeStyle = pal.waterFill;
+                  ctx.lineWidth = Math.max(
+                    0.4,
+                    wScale * (0.22 + Math.min(0.98, cam.zoom * 65))
+                  );
+                  ctx.stroke();
+                }
+              }
+            }
+
+            for (const river of CZECH_RIVERS) {
+              if (realDataset && !SUPPLEMENTAL_RIVER_IDS.has(river.id)) continue;
+              ctx.beginPath();
+              if (
+                !traceClippedGeoPolyline(
+                  ctx,
+                  river.points,
+                  geoToWorld,
+                  wxToSx,
+                  wyToSy,
+                  width,
+                  height,
+                  false
+                )
+              ) {
+                continue;
+              }
+              ctx.lineCap = 'round';
+              ctx.lineJoin = 'round';
+              ctx.strokeStyle = pal.waterStroke;
+              ctx.lineWidth = Math.max(
+                0.75,
+                river.width * (0.42 + Math.min(1.75, cam.zoom * 115))
+              );
+              ctx.stroke();
+              ctx.strokeStyle = pal.waterFill;
+              ctx.lineWidth = Math.max(
+                0.4,
+                river.width * (0.22 + Math.min(0.98, cam.zoom * 65))
+              );
+              ctx.stroke();
+            }
           }
         }
 
@@ -2936,43 +3707,29 @@ export const CzechMapCanvas = forwardRef<
             : 'rgba(180, 152, 122, 0.14)';
           ctx.lineWidth = 0.5;
 
-          if (realDataset) {
-            for (const u of realDataset.vectors.urban) {
-              for (const ring of u.rings) {
-                ctx.beginPath();
-                ring.forEach(([lon, lat], i) => {
-                  const wPt = geoToWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
-              }
+          for (const area of CZECH_URBAN_AREAS) {
+            const screenRing = area.points.map(([lon, lat]) => {
+              const wPt = geoToWorld(lon, lat);
+              return { x: wxToSx(wPt.x), y: wyToSy(wPt.y) };
+            });
+            const clipped = clipPolygonToRect(
+              screenRing,
+              -16,
+              -16,
+              width + 16,
+              height + 16
+            );
+            if (clipped.length < 3) continue;
+            ctx.beginPath();
+            ctx.moveTo(clipped[0].x, clipped[0].y);
+            for (let i = 1; i < clipped.length; i++) {
+              ctx.lineTo(clipped[i].x, clipped[i].y);
             }
-          } else {
-            for (const area of CZECH_URBAN_AREAS) {
-              ctx.beginPath();
-              area.points.forEach(([lon, lat], i) => {
-                const wPt = geoToWorld(lon, lat);
-                const sx = wxToSx(wPt.x);
-                const sy = wyToSy(wPt.y);
-                if (i === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
-              });
-              ctx.closePath();
-              ctx.fill();
-              ctx.stroke();
-            }
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
           }
           ctx.restore();
-        }
-
-        // 7. OSM Full Transport Network (Aeroways, Railways, Motorways -> Local Streets, Shields & Street Names)
-        if (czHasOsm) {
-          renderOsmTransport(czOsmTiles, czOsmRc);
         }
 
         // 7a. Real Czech Railway Network fallback (while OSM tiles load)
@@ -2985,13 +3742,20 @@ export const CzechMapCanvas = forwardRef<
             for (const line of rail.lines) {
               if (line.length < 2) continue;
               ctx.beginPath();
-              line.forEach(([lon, lat], i) => {
-                const wPt = geoToWorld(lon, lat);
-                const sx = wxToSx(wPt.x);
-                const sy = wyToSy(wPt.y);
-                if (i === 0) ctx.moveTo(sx, sy);
-                else ctx.lineTo(sx, sy);
-              });
+              if (
+                !traceClippedGeoPolyline(
+                  ctx,
+                  line,
+                  geoToWorld,
+                  wxToSx,
+                  wyToSy,
+                  width,
+                  height,
+                  false
+                )
+              ) {
+                continue;
+              }
               ctx.setLineDash([]);
               ctx.strokeStyle = pal.isDark
                 ? 'rgba(148, 163, 184, 0.55)'
@@ -3021,60 +3785,74 @@ export const CzechMapCanvas = forwardRef<
               const isSec = rd.type === 'Secondary Highway';
               for (const line of rd.lines) {
                 ctx.beginPath();
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.strokeStyle = pal.isDark
                   ? 'rgba(148, 163, 184, 0.45)'
                   : isSec
-                    ? 'rgba(146, 108, 68, 0.65)'
-                    : 'rgba(148, 134, 112, 0.42)';
+                    ? 'rgba(198, 126, 28, 0.76)'
+                    : 'rgba(202, 142, 46, 0.66)';
                 ctx.lineWidth = isSec
                   ? cam.zoom >= 0.006
-                    ? 2.8
-                    : 1.8
+                    ? 1.98
+                    : 1.35
                   : cam.zoom >= 0.006
-                    ? 1.9
-                    : 1.1;
+                    ? 1.4
+                    : 0.9;
                 ctx.stroke();
 
                 ctx.strokeStyle = pal.isDark
                   ? '#475569'
                   : isSec
-                    ? '#FEF08A'
-                    : '#FAF5E4';
+                    ? '#F7AC38'
+                    : '#F9C75E';
                 ctx.lineWidth = isSec
                   ? cam.zoom >= 0.006
-                    ? 1.4
-                    : 0.9
+                    ? 1.1
+                    : 0.75
                   : cam.zoom >= 0.006
-                    ? 0.95
-                    : 0.55;
+                    ? 0.75
+                    : 0.48;
                 ctx.stroke();
               }
             }
 
-            // Second pass: Major Highways / Expressways (Dálnice)
+            // Second pass: Major Highways / Expressways (Dálnice — Mapy.com green)
             for (const rd of realDataset.vectors.roads) {
               if (rd.type !== 'Major Highway' && rd.exp !== 1) continue;
               for (const line of rd.lines) {
                 ctx.beginPath();
-                line.forEach(([lon, lat], i) => {
-                  const wPt = geoToWorld(lon, lat);
-                  const sx = wxToSx(wPt.x);
-                  const sy = wyToSy(wPt.y);
-                  if (i === 0) ctx.moveTo(sx, sy);
-                  else ctx.lineTo(sx, sy);
-                });
+                if (
+                  !traceClippedGeoPolyline(
+                    ctx,
+                    line,
+                    geoToWorld,
+                    wxToSx,
+                    wyToSy,
+                    width,
+                    height,
+                    false
+                  )
+                ) {
+                  continue;
+                }
                 ctx.strokeStyle = pal.highwayCasing;
-                ctx.lineWidth = cam.zoom >= 0.004 ? 4.0 : 2.6;
+                ctx.lineWidth = cam.zoom >= 0.004 ? 2.45 : 1.68;
                 ctx.stroke();
                 ctx.strokeStyle = pal.highwayCore;
-                ctx.lineWidth = cam.zoom >= 0.004 ? 1.9 : 1.25;
+                ctx.lineWidth = cam.zoom >= 0.004 ? 1.38 : 0.92;
                 ctx.stroke();
               }
             }
@@ -3098,10 +3876,10 @@ export const CzechMapCanvas = forwardRef<
                   const isPrimary = hw.roadType === 'primary';
                   const bw = isPrimary ? 28 : 24;
                   const bh = isPrimary ? 13 : 14;
-                  ctx.fillStyle = isPrimary ? '#1D4ED8' : pal.highwayBadgeBg;
+                  ctx.fillStyle = isPrimary ? '#3E82B8' : pal.highwayBadgeBg;
                   ctx.fillRect(mx - bw / 2, my - bh / 2, bw, bh);
-                  ctx.strokeStyle = '#FFFFFF';
-                  ctx.lineWidth = 0.85;
+                  ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+                  ctx.lineWidth = 0.9;
                   ctx.strokeRect(mx - bw / 2, my - bh / 2, bw, bh);
                   ctx.fillStyle = '#FFFFFF';
                   ctx.font = `700 ${isPrimary ? '8' : '8.5'}px "JetBrains Mono", monospace`;
@@ -3123,50 +3901,60 @@ export const CzechMapCanvas = forwardRef<
               ctx.lineJoin = 'round';
               ctx.strokeStyle =
                 hw.roadType === 'primary'
-                  ? 'rgba(140, 118, 88, 0.55)'
+                  ? 'rgba(198, 126, 28, 0.72)'
                   : pal.highwayCasing;
-              ctx.lineWidth = hw.roadType === 'primary' ? 2.0 : 3.2;
+              ctx.lineWidth = hw.roadType === 'primary' ? 1.45 : 2.1;
               ctx.stroke();
 
               drawSmoothPoints(ctx, sPts);
               ctx.strokeStyle =
-                hw.roadType === 'primary' ? '#FEF3C7' : pal.highwayCore;
-              ctx.lineWidth = hw.roadType === 'primary' ? 1.0 : 1.5;
+                hw.roadType === 'primary' ? '#F7AC38' : pal.highwayCore;
+              ctx.lineWidth = hw.roadType === 'primary' ? 0.8 : 1.15;
               ctx.stroke();
             }
           }
         }
 
-        // 8. Cities, Towns & Villages (2,200 real settlements with progressive zoom LOD & spatial decluttering)
+        // 8. Cities, Towns & Villages (Multi-stage LOD across all 8 zoom levels with clear hierarchy)
         if (layers.cities) {
           const placedCzCities: { x: number; y: number }[] = [];
           const minCzCityDistPx =
-            cam.zoom < 0.0022
-              ? 60
-              : cam.zoom < 0.0038
-                ? 52
-                : cam.zoom < 0.007
-                  ? 44
-                  : cam.zoom < 0.014
-                    ? 36
-                    : cam.zoom < 0.025
-                      ? 28
-                      : 22;
+            cam.zoom < 0.0032
+              ? 74
+              : cam.zoom < 0.0068
+                ? 66
+                : cam.zoom < 0.0135
+                  ? 58
+                  : cam.zoom < 0.027
+                    ? 52
+                    : cam.zoom < 0.055
+                      ? 48
+                      : cam.zoom < 0.11
+                        ? 44
+                        : cam.zoom < 0.2
+                          ? 40
+                          : 34;
 
           if (realDataset) {
-            for (const city of realDataset.places.cities) {
+            const sortedCzCities = [...realDataset.places.cities].sort(
+              (a, b) => b.t - a.t || b.p - a.p
+            );
+
+            for (const city of sortedCzCities) {
               const visibleAtZoom =
-                cam.zoom < 0.002
-                  ? city.t >= 2 || city.p >= 42000
-                  : cam.zoom < 0.0036
-                    ? city.t >= 1 || city.p >= 18000
-                    : cam.zoom < 0.0065
-                      ? city.t >= 1 || city.p >= 7500
-                      : cam.zoom < 0.012
-                        ? city.p >= 3200
-                        : cam.zoom < 0.022
-                          ? city.p >= 1200
-                          : true;
+                cam.zoom < 0.0032
+                  ? city.t >= 2 || city.p >= 44000
+                  : cam.zoom < 0.0068
+                    ? city.t >= 2 || (city.t >= 1 && city.p >= 18000) || city.p >= 22000
+                    : cam.zoom < 0.0135
+                      ? city.t >= 1 || city.p >= 10500
+                      : cam.zoom < 0.027
+                        ? city.t >= 1 || city.p >= 4600
+                        : cam.zoom < 0.055
+                          ? city.p >= 1600
+                          : cam.zoom < 0.11
+                            ? city.p >= 520
+                            : true;
               if (!visibleAtZoom) continue;
 
               const wPt = geoToWorld(city.x, city.y);
@@ -3193,28 +3981,42 @@ export const CzechMapCanvas = forwardRef<
 
               const isCap = city.t === 3;
               const isReg = city.t === 2;
+              const isDist = city.t === 1;
+              const isVillage = !isCap && !isReg && !isDist && city.p < 2500;
               const r = isCap
-                ? 5.5
+                ? 3.6
                 : isReg
-                  ? 4.0
-                  : city.p >= 35000
-                    ? 3.2
-                    : city.p >= 8000
-                      ? 2.5
-                      : 1.9;
+                  ? 2.8
+                  : isDist || city.p >= 25000
+                    ? 2.35
+                    : city.p >= 5000
+                      ? 1.95
+                      : city.p >= 1500
+                        ? 1.65
+                        : 1.35;
 
               ctx.font = isCap
-                ? '700 13.5px "Outfit", sans-serif'
+                ? '700 12.6px "Plus Jakarta Sans", sans-serif'
                 : isReg
-                  ? '700 11.5px "Plus Jakarta Sans", sans-serif'
-                  : city.p >= 15000
-                    ? '600 10.5px "Plus Jakarta Sans", sans-serif'
-                    : '500 9.5px "Plus Jakarta Sans", sans-serif';
-              const tw = ctx.measureText(city.n).width;
-              const lx = sx + r + 5;
-              const ly = sy;
+                  ? '600 11px "Plus Jakarta Sans", sans-serif'
+                  : isDist || city.p >= 20000
+                    ? '600 10px "Plus Jakarta Sans", sans-serif'
+                    : city.p >= 4000
+                      ? '500 9.4px "Plus Jakarta Sans", sans-serif'
+                      : '500 8.8px "Plus Jakarta Sans", sans-serif';
+              const displayLabel = isCap ? city.n.toUpperCase() : city.n;
+              const tw = ctx.measureText(displayLabel).width;
+              const boxH = isCap ? 14 : 11.5;
+              const lx = sx;
+              const ly = sy - r - boxH * 0.45 - 1.4;
               if (
-                !tryPlaceBox(sx - r - 2, ly - 7, r * 2 + 8 + tw, 14, false)
+                !tryPlaceBox(
+                  sx - Math.max(tw * 0.5 + 3, r + 2),
+                  ly - boxH * 0.5,
+                  Math.max(tw + 6, r * 2 + 4),
+                  boxH + r * 2 + 3,
+                  false
+                )
               ) {
                 continue;
               }
@@ -3223,30 +4025,23 @@ export const CzechMapCanvas = forwardRef<
 
               ctx.beginPath();
               ctx.arc(sx, sy, r, 0, Math.PI * 2);
-              ctx.fillStyle = isCap ? '#B91C1C' : pal.cityRing;
+              ctx.fillStyle = pal.cityRing;
               ctx.fill();
-              ctx.lineWidth = isCap ? 2 : 1.3;
+              ctx.lineWidth = isCap ? 1.3 : isVillage ? 0.9 : 1.05;
               ctx.strokeStyle = pal.cityDot;
               ctx.stroke();
 
-              if (isReg) {
-                ctx.beginPath();
-                ctx.arc(sx, sy, 1.5, 0, Math.PI * 2);
-                ctx.fillStyle = pal.cityDot;
-                ctx.fill();
-              }
-
-              ctx.textAlign = 'left';
+              ctx.textAlign = 'center';
               ctx.textBaseline = 'middle';
-              ctx.lineWidth = 3.2;
+              ctx.lineWidth = 3.0;
               ctx.strokeStyle = pal.textHalo;
-              ctx.strokeText(city.n, lx, ly);
+              ctx.strokeText(displayLabel, lx, ly);
               ctx.fillStyle = pal.textPrimary;
-              ctx.fillText(city.n, lx, ly);
+              ctx.fillText(displayLabel, lx, ly);
             }
 
-            // Supplement close zoom (z >= 11) with OSM villages, hamlets & city quarters
-            if (czHasOsm && czOsmTargetZ >= 11) {
+            // Supplement with OSM cities/towns (including neighboring foreign cities at z >= 7), villages at z >= 11, and localities at z >= 13
+            if (czHasOsm && czOsmTargetZ >= 7) {
               const seenCzNames = new Set(
                 realDataset.places.cities.map((c) => c.n.toLowerCase())
               );
@@ -3258,7 +4053,8 @@ export const CzechMapCanvas = forwardRef<
                 rank: number;
               }[] = [];
               for (const tile of czOsmTiles) {
-                for (const pl of tile.places) {
+                if (tile.clipBounds) continue;
+                for (const pl of tile.labels.places) {
                   if (
                     pl.lon < czMinLon ||
                     pl.lon > czMaxLon ||
@@ -3268,8 +4064,31 @@ export const CzechMapCanvas = forwardRef<
                     continue;
                   }
                   if (
-                    czOsmTargetZ < 12 &&
-                    (pl.cls === 'hamlet' || pl.cls === 'quarter')
+                    czOsmTargetZ <= 8 &&
+                    pl.cls !== 'city' &&
+                    !(pl.cls === 'town' && pl.rank <= 6)
+                  ) {
+                    continue;
+                  }
+                  if (
+                    czOsmTargetZ === 9 &&
+                    pl.cls !== 'city' &&
+                    !(pl.cls === 'town' && pl.rank <= 7)
+                  ) {
+                    continue;
+                  }
+                  if (
+                    czOsmTargetZ === 10 &&
+                    pl.cls !== 'city' &&
+                    pl.cls !== 'town'
+                  ) {
+                    continue;
+                  }
+                  if (
+                    czOsmTargetZ <= 12 &&
+                    (pl.cls === 'hamlet' ||
+                      pl.cls === 'quarter' ||
+                      pl.cls === 'suburb')
                   ) {
                     continue;
                   }
@@ -3279,7 +4098,17 @@ export const CzechMapCanvas = forwardRef<
                   osmExtraPlaces.push(pl);
                 }
               }
-              osmExtraPlaces.sort((a, b) => a.rank - b.rank);
+              const clsOrder = (c: string) =>
+                c === 'city'
+                  ? 0
+                  : c === 'town'
+                    ? 1
+                    : c === 'village'
+                      ? 2
+                      : 3;
+              osmExtraPlaces.sort(
+                (a, b) => clsOrder(a.cls) - clsOrder(b.cls) || a.rank - b.rank
+              );
               for (const pl of osmExtraPlaces) {
                 const wPt = geoToWorld(pl.lon, pl.lat);
                 const sx = wxToSx(wPt.x);
@@ -3292,48 +4121,66 @@ export const CzechMapCanvas = forwardRef<
                 ) {
                   continue;
                 }
+                const isLocality =
+                  pl.cls === 'suburb' ||
+                  pl.cls === 'quarter' ||
+                  pl.cls === 'hamlet';
+                const reqDist = isLocality
+                  ? Math.max(46, minCzCityDistPx)
+                  : minCzCityDistPx;
                 let tooClose = false;
                 for (let i = 0; i < placedCzCities.length; i++) {
                   const dx = placedCzCities[i].x - sx;
                   const dy = placedCzCities[i].y - sy;
-                  if (dx * dx + dy * dy < minCzCityDistPx * minCzCityDistPx) {
+                  if (dx * dx + dy * dy < reqDist * reqDist) {
                     tooClose = true;
                     break;
                   }
                 }
                 if (tooClose) continue;
-                const r = pl.cls === 'town' ? 2.2 : 1.7;
-                ctx.font =
-                  pl.cls === 'suburb' || pl.cls === 'quarter'
-                    ? '500 9px "Plus Jakarta Sans", sans-serif'
-                    : '500 9.2px "Plus Jakarta Sans", sans-serif';
+                const isMajorCity = pl.cls === 'city';
+                const isTown = pl.cls === 'town';
+                const r = isMajorCity ? 2.6 : isTown ? 2.0 : 1.4;
+                ctx.font = isMajorCity
+                  ? '600 10.6px "Plus Jakarta Sans", sans-serif'
+                  : isTown
+                    ? '500 9.5px "Plus Jakarta Sans", sans-serif'
+                    : isLocality
+                      ? '500 8.3px "Plus Jakarta Sans", sans-serif'
+                      : '500 8.8px "Plus Jakarta Sans", sans-serif';
                 const tw = ctx.measureText(pl.name).width;
-                const lx = sx + r + 4.5;
-                const ly = sy;
+                const boxH = isMajorCity ? 12.5 : isLocality ? 10 : 11;
+                const lx = sx;
+                const ly = isLocality ? sy : sy - r - boxH * 0.45 - 1.4;
                 if (
-                  !tryPlaceBox(sx - r - 2, ly - 6.5, r * 2 + 8 + tw, 13, false)
+                  !tryPlaceBox(
+                    sx - Math.max(tw * 0.5 + 3, r + 2),
+                    ly - boxH * 0.5,
+                    Math.max(tw + 6, r * 2 + 4),
+                    boxH + (isLocality ? 2 : r * 2 + 3),
+                    false
+                  )
                 ) {
                   continue;
                 }
                 placedCzCities.push({ x: sx, y: sy });
-                if (pl.cls !== 'suburb' && pl.cls !== 'quarter') {
+                if (!isLocality) {
                   ctx.beginPath();
                   ctx.arc(sx, sy, r, 0, Math.PI * 2);
                   ctx.fillStyle = pal.cityRing;
                   ctx.fill();
-                  ctx.lineWidth = 1.15;
+                  ctx.lineWidth = isMajorCity || isTown ? 1.05 : 0.9;
                   ctx.strokeStyle = pal.cityDot;
                   ctx.stroke();
                 }
-                ctx.textAlign = 'left';
+                ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.lineWidth = 2.8;
+                ctx.lineWidth = isLocality ? 2.5 : 2.9;
                 ctx.strokeStyle = pal.textHalo;
                 ctx.strokeText(pl.name, lx, ly);
-                ctx.fillStyle =
-                  pl.cls === 'suburb' || pl.cls === 'quarter'
-                    ? pal.textSecondary
-                    : pal.textPrimary;
+                ctx.fillStyle = isLocality
+                  ? pal.textSecondary
+                  : pal.textPrimary;
                 ctx.fillText(pl.name, lx, ly);
               }
             }
@@ -3364,72 +4211,146 @@ export const CzechMapCanvas = forwardRef<
                 continue;
 
               const r = city.isCapital
-                ? 5.5
+                ? 3.6
                 : city.isRegionalSeat
-                  ? 4.0
+                  ? 2.8
                   : city.population >= 45000
-                    ? 3.2
-                    : 2.5;
+                    ? 2.35
+                    : 1.95;
 
               ctx.font = city.isCapital
-                ? '700 13.5px "Outfit", sans-serif'
+                ? '700 12.6px "Plus Jakarta Sans", sans-serif'
                 : city.isRegionalSeat
-                  ? '700 11.5px "Plus Jakarta Sans", sans-serif'
-                  : '500 10.5px "Plus Jakarta Sans", sans-serif';
-              const tw = ctx.measureText(city.name).width;
-              const lx = sx + r + 5;
-              const ly = sy;
+                  ? '600 11px "Plus Jakarta Sans", sans-serif'
+                  : '500 9.6px "Plus Jakarta Sans", sans-serif';
+              const displayLabel = city.isCapital
+                ? city.name.toUpperCase()
+                : city.name;
+              const tw = ctx.measureText(displayLabel).width;
+              const boxH = city.isCapital ? 14 : 11.5;
+              const lx = sx;
+              const ly = sy - r - boxH * 0.45 - 1.4;
               if (
-                !tryPlaceBox(sx - r - 2, ly - 7, r * 2 + 8 + tw, 14, false)
+                !tryPlaceBox(
+                  sx - Math.max(tw * 0.5 + 3, r + 2),
+                  ly - boxH * 0.5,
+                  Math.max(tw + 6, r * 2 + 4),
+                  boxH + r * 2 + 3,
+                  false
+                )
               ) {
                 continue;
               }
 
               ctx.beginPath();
               ctx.arc(sx, sy, r, 0, Math.PI * 2);
-              ctx.fillStyle = city.isCapital ? '#B91C1C' : pal.cityRing;
+              ctx.fillStyle = pal.cityRing;
               ctx.fill();
-              ctx.lineWidth = city.isCapital ? 2 : 1.5;
+              ctx.lineWidth = city.isCapital ? 1.3 : 1.05;
               ctx.strokeStyle = pal.cityDot;
               ctx.stroke();
 
-              ctx.textAlign = 'left';
+              ctx.textAlign = 'center';
               ctx.textBaseline = 'middle';
-              ctx.lineWidth = 3.4;
+              ctx.lineWidth = 3.0;
               ctx.strokeStyle = pal.textHalo;
-              ctx.strokeText(city.name, lx, ly);
+              ctx.strokeText(displayLabel, lx, ly);
               ctx.fillStyle = pal.textPrimary;
-              ctx.fillText(city.name, lx, ly);
+              ctx.fillText(displayLabel, lx, ly);
             }
           }
         }
 
-        // 9. Mountain Peaks (▲) (Progressive zoom LOD & spatial decluttering)
+        // 9. Mountain Peaks (▲) (Unified elevation-sorted LOD across all 8 zoom levels with generous spacing)
         if (layers.peaks) {
           const placedCzPeaks: { x: number; y: number }[] = [];
           const minCzPeakDistPx =
-            cam.zoom < 0.0022
-              ? 82
-              : cam.zoom < 0.004
-                ? 68
-                : cam.zoom < 0.0075
-                  ? 54
-                  : cam.zoom < 0.014
-                    ? 42
-                    : 28;
+            cam.zoom < 0.0032
+              ? 170
+              : cam.zoom < 0.0068
+                ? 145
+                : cam.zoom < 0.0135
+                  ? 130
+                  : cam.zoom < 0.027
+                    ? 120
+                    : cam.zoom < 0.055
+                      ? 112
+                      : cam.zoom < 0.11
+                        ? 105
+                        : cam.zoom < 0.2
+                          ? 92
+                          : 78;
+
+          const minPeakElev =
+            cam.zoom < 0.0032
+              ? 1380
+              : cam.zoom < 0.0068
+                ? 1200
+                : cam.zoom < 0.0135
+                  ? 1020
+                  : cam.zoom < 0.027
+                    ? 840
+                    : cam.zoom < 0.055
+                      ? 700
+                      : cam.zoom < 0.11
+                        ? 540
+                        : cam.zoom < 0.2
+                          ? 360
+                          : 200;
 
           if (realDataset) {
-            for (const peak of realDataset.places.peaks) {
-              const visibleAtZoom =
-                cam.zoom < 0.0022
-                  ? peak.e >= 1050 || peak.n === 'Říp'
-                  : cam.zoom < 0.0045
-                    ? peak.e >= 800 || peak.n === 'Říp'
-                    : cam.zoom < 0.01
-                      ? peak.e >= 580
-                      : true;
-              if (!visibleAtZoom) continue;
+            const unifiedPeaks: {
+              x: number;
+              y: number;
+              n: string;
+              e: number;
+            }[] = [];
+            const seenCzPeaks = new Set<string>();
 
+            for (const peak of realDataset.places.peaks) {
+              if (peak.e < minPeakElev) continue;
+              if (
+                peak.x < czMinLon ||
+                peak.x > czMaxLon ||
+                peak.y < czMinLat ||
+                peak.y > czMaxLat
+              ) {
+                continue;
+              }
+              seenCzPeaks.add(peak.n.toLowerCase());
+              unifiedPeaks.push(peak);
+            }
+
+            if (czHasOsm && czOsmTargetZ >= 11) {
+              for (const tile of czOsmTiles) {
+                if (tile.clipBounds) continue;
+                for (const pk of tile.labels.peaks) {
+                  if (pk.ele < minPeakElev) continue;
+                  if (
+                    pk.lon < czMinLon ||
+                    pk.lon > czMaxLon ||
+                    pk.lat < czMinLat ||
+                    pk.lat > czMaxLat
+                  ) {
+                    continue;
+                  }
+                  const key = pk.name.toLowerCase();
+                  if (seenCzPeaks.has(key)) continue;
+                  seenCzPeaks.add(key);
+                  unifiedPeaks.push({
+                    x: pk.lon,
+                    y: pk.lat,
+                    n: pk.name,
+                    e: pk.ele,
+                  });
+                }
+              }
+            }
+
+            // Sort all candidate peaks by elevation descending so the highest summits in every range win
+            unifiedPeaks.sort((a, b) => b.e - a.e);
+
+            for (const peak of unifiedPeaks) {
               const wPt = geoToWorld(peak.x, peak.y);
               const sx = wxToSx(wPt.x);
               const sy = wyToSy(wPt.y);
@@ -3453,111 +4374,32 @@ export const CzechMapCanvas = forwardRef<
               if (tooClose) continue;
 
               const label = `${peak.n} ${peak.e}`;
-              ctx.font = 'italic 600 9.5px "Plus Jakarta Sans", sans-serif';
+              ctx.font = 'italic 500 8.5px "Plus Jakarta Sans", sans-serif';
               const tw = ctx.measureText(label).width;
-              const lx = sx + 6.5;
-              const ly = sy + 1;
-              if (!tryPlaceBox(sx - 5, ly - 6, tw + 13, 12, false)) continue;
+              const lx = sx + 4.8;
+              const ly = sy + 0.5;
+              if (!tryPlaceBox(sx - 4, ly - 5.5, tw + 11, 11, false)) continue;
 
               placedCzPeaks.push({ x: sx, y: sy });
 
               ctx.beginPath();
-              ctx.moveTo(sx, sy - 4.6);
-              ctx.lineTo(sx + 4.0, sy + 3.1);
-              ctx.lineTo(sx - 4.0, sy + 3.1);
+              ctx.moveTo(sx, sy - 2.9);
+              ctx.lineTo(sx + 2.5, sy + 1.9);
+              ctx.lineTo(sx - 2.5, sy + 1.9);
               ctx.closePath();
               ctx.fillStyle = pal.peakColor;
               ctx.strokeStyle = pal.textHalo;
-              ctx.lineWidth = 1.45;
+              ctx.lineWidth = 1.05;
               ctx.stroke();
               ctx.fill();
 
               ctx.textAlign = 'left';
               ctx.textBaseline = 'middle';
-              ctx.lineWidth = 2.8;
+              ctx.lineWidth = 2.3;
               ctx.strokeStyle = pal.textHalo;
               ctx.strokeText(label, lx, ly);
               ctx.fillStyle = pal.peakColor;
               ctx.fillText(label, lx, ly);
-            }
-
-            // Supplement close zoom (z >= 11) with local OSM mountain peaks
-            if (czHasOsm && czOsmTargetZ >= 11) {
-              const seenCzPeaks = new Set(
-                realDataset.places.peaks.map((p) => p.n.toLowerCase())
-              );
-              const osmExtraPeaks: {
-                lon: number;
-                lat: number;
-                name: string;
-                ele: number;
-              }[] = [];
-              for (const tile of czOsmTiles) {
-                for (const pk of tile.peaks) {
-                  if (
-                    pk.lon < czMinLon ||
-                    pk.lon > czMaxLon ||
-                    pk.lat < czMinLat ||
-                    pk.lat > czMaxLat
-                  ) {
-                    continue;
-                  }
-                  const key = pk.name.toLowerCase();
-                  if (seenCzPeaks.has(key)) continue;
-                  seenCzPeaks.add(key);
-                  osmExtraPeaks.push(pk);
-                }
-              }
-              osmExtraPeaks.sort((a, b) => b.ele - a.ele);
-              for (const pk of osmExtraPeaks) {
-                const wPt = geoToWorld(pk.lon, pk.lat);
-                const sx = wxToSx(wPt.x);
-                const sy = wyToSy(wPt.y);
-                if (
-                  sx < -20 ||
-                  sx > width + 20 ||
-                  sy < -20 ||
-                  sy > height + 20
-                ) {
-                  continue;
-                }
-                let tooClose = false;
-                for (let i = 0; i < placedCzPeaks.length; i++) {
-                  const dx = placedCzPeaks[i].x - sx;
-                  const dy = placedCzPeaks[i].y - sy;
-                  if (dx * dx + dy * dy < minCzPeakDistPx * minCzPeakDistPx) {
-                    tooClose = true;
-                    break;
-                  }
-                }
-                if (tooClose) continue;
-                const label = `${pk.name} ${pk.ele}`;
-                ctx.font = 'italic 600 9.2px "Plus Jakarta Sans", sans-serif';
-                const tw = ctx.measureText(label).width;
-                const lx = sx + 6.2;
-                const ly = sy + 1;
-                if (!tryPlaceBox(sx - 5, ly - 6, tw + 13, 12, false)) continue;
-                placedCzPeaks.push({ x: sx, y: sy });
-
-                ctx.beginPath();
-                ctx.moveTo(sx, sy - 4.3);
-                ctx.lineTo(sx + 3.7, sy + 2.9);
-                ctx.lineTo(sx - 3.7, sy + 2.9);
-                ctx.closePath();
-                ctx.fillStyle = pal.peakColor;
-                ctx.strokeStyle = pal.textHalo;
-                ctx.lineWidth = 1.35;
-                ctx.stroke();
-                ctx.fill();
-
-                ctx.textAlign = 'left';
-                ctx.textBaseline = 'middle';
-                ctx.lineWidth = 2.6;
-                ctx.strokeStyle = pal.textHalo;
-                ctx.strokeText(label, lx, ly);
-                ctx.fillStyle = pal.peakColor;
-                ctx.fillText(label, lx, ly);
-              }
             }
           } else {
             const sortedPeaks = [...CZECH_PEAKS].sort(
@@ -3612,6 +4454,14 @@ export const CzechMapCanvas = forwardRef<
             }
           }
         }
+
+        // 9b. OSM Water & Transport Labels (placed after cities & peaks so arriving tiles never shift settlement or summit labels)
+        if (czHasOsm) {
+          if (layers.hydrology) {
+            renderOsmWaterLabels(czOsmTiles, czOsmRc);
+          }
+          renderOsmTransportLabels(czOsmTiles, czOsmRc);
+        }
       }
 
       // 10. Imported GPX Tracks & Waypoints (Works seamlessly in both CZ and World scopes!)
@@ -3630,32 +4480,55 @@ export const CzechMapCanvas = forwardRef<
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
 
-        // Build path
+        // Build viewport-clipped path
         ctx.beginPath();
-        track.points.forEach((pt, idx) => {
-          const wPt = projectGeo(pt.lon, pt.lat);
-          const sx = wxToSx(wPt.x);
-          const sy = wyToSy(wPt.y);
-          if (idx === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        });
-
-        // Subtle outer glow for active track
-        if (isActive) {
-          ctx.strokeStyle = 'rgba(28, 36, 32, 0.22)';
-          ctx.lineWidth = 9.5;
-          ctx.stroke();
+        let hasTrackSeg = false;
+        {
+          const p0 = projectGeo(track.points[0].lon, track.points[0].lat);
+          let prevX = wxToSx(p0.x);
+          let prevY = wyToSy(p0.y);
+          for (let idx = 1; idx < track.points.length; idx++) {
+            const p = projectGeo(track.points[idx].lon, track.points[idx].lat);
+            const nx = wxToSx(p.x);
+            const ny = wyToSy(p.y);
+            if (
+              addClippedSegment(
+                ctx,
+                prevX,
+                prevY,
+                nx,
+                ny,
+                -32,
+                -32,
+                width + 32,
+                height + 32
+              )
+            ) {
+              hasTrackSeg = true;
+            }
+            prevX = nx;
+            prevY = ny;
+          }
         }
 
-        // Crisp white/dark halo casing
-        ctx.strokeStyle = pal.isDark ? '#0F172A' : '#FFFFFF';
-        ctx.lineWidth = isActive ? 6.2 : 4.8;
-        ctx.stroke();
+        if (hasTrackSeg) {
+          // Subtle outer glow for active track
+          if (isActive) {
+            ctx.strokeStyle = 'rgba(28, 36, 32, 0.22)';
+            ctx.lineWidth = 9.5;
+            ctx.stroke();
+          }
 
-        // Vivid track line
-        ctx.strokeStyle = track.color;
-        ctx.lineWidth = isActive ? 3.5 : 2.4;
-        ctx.stroke();
+          // Crisp white/dark halo casing
+          ctx.strokeStyle = pal.isDark ? '#0F172A' : '#FFFFFF';
+          ctx.lineWidth = isActive ? 6.2 : 4.8;
+          ctx.stroke();
+
+          // Vivid track line
+          ctx.strokeStyle = track.color;
+          ctx.lineWidth = isActive ? 3.5 : 2.4;
+          ctx.stroke();
+        }
 
         // Start (green) & Finish (crimson/track color) markers
         const first = projectGeo(track.points[0].lon, track.points[0].lat);
@@ -3771,10 +4644,13 @@ export const CzechMapCanvas = forwardRef<
       worldPlacesIndex,
       blockRevision,
       osmRevision,
+      scheduleOsmRedraw,
+      scheduleBlockRedraw,
       borderWorld,
       layers,
       terrain.contours,
       worldTerrain.contours,
+      zoomLevels,
       selectedPoint,
       gpxTracks,
       activeGpxId,
@@ -3782,22 +4658,30 @@ export const CzechMapCanvas = forwardRef<
     ]
   );
 
-  // Redraw canvas on state changes
+  // Redraw canvas on state changes (cap DPR & total backing pixels to keep GPU VRAM light inside iframe)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
     const w = viewportSize.width;
     const h = viewportSize.height;
     if (w === 0 || h === 0) return;
 
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
+    const rawDpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const maxPixels = 2_600_000;
+    const pixelBudgetScale = Math.sqrt(maxPixels / Math.max(1, w * h));
+    const dpr = Math.max(1, Math.min(rawDpr, pixelBudgetScale));
+
+    const targetW = Math.round(w * dpr);
+    const targetH = Math.round(h * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     ctx.save();
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     renderMap(ctx, w, h, camera);
     ctx.restore();
   }, [viewportSize, camera, renderMap]);
@@ -3805,24 +4689,26 @@ export const CzechMapCanvas = forwardRef<
   useImperativeHandle(
     ref,
     () => ({
-      zoomIn: () =>
-        setCamera((c) => ({ ...c, zoom: Math.min(maxZoom, c.zoom * 1.35) })),
-      zoomOut: () =>
-        setCamera((c) => ({ ...c, zoom: Math.max(minZoom, c.zoom / 1.35) })),
+      zoomIn: () => setZoomToLevelIndex(activeZoomIndex + 1),
+      zoomOut: () => setZoomToLevelIndex(activeZoomIndex - 1),
       resetView: () =>
         setCamera({
           cx: activeWidth * 0.5,
           cy: activeHeight * 0.49,
-          zoom: fitZoom,
+          zoom: zoomLevels[0].zoom,
         }),
       focusGeo: (lon: number, lat: number, targetZoom?: number) => {
         const wPt = projectGeo(lon, lat);
-        const defaultZoom = mapScope === 'world' ? 0.00025 : 0.0065;
-        setCamera((c) => ({
-          cx: wPt.x,
-          cy: wPt.y,
-          zoom: targetZoom ?? Math.max(c.zoom, defaultZoom),
-        }));
+        const defaultZoom = mapScope === 'world' ? 0.0025 : 0.0058;
+        setCamera((c) => {
+          const desired = targetZoom ?? Math.max(c.zoom, defaultZoom);
+          const snappedIdx = findNearestZoomIndex(zoomLevels, desired);
+          return {
+            cx: wPt.x,
+            cy: wPt.y,
+            zoom: zoomLevels[snappedIdx].zoom,
+          };
+        });
       },
       fitGeoBounds: (bounds) => {
         const topLeft = projectGeo(bounds.minLon, bounds.maxLat);
@@ -3831,37 +4717,38 @@ export const CzechMapCanvas = forwardRef<
         const bh = Math.max(3000, botRight.y - topLeft.y);
         const zx = (viewportSize.width * 0.72) / bw;
         const zy = (viewportSize.height * 0.66) / bh;
-        const nextZoom = Math.max(
-          minZoom,
-          Math.min(maxZoom, Math.min(zx, zy))
-        );
+        const rawZoom = Math.min(zx, zy);
+        let chosenIdx = 0;
+        for (let i = 0; i < zoomLevels.length; i++) {
+          if (zoomLevels[i].zoom <= rawZoom * 1.15) chosenIdx = i;
+        }
         setCamera({
           cx: (topLeft.x + botRight.x) * 0.5,
           cy: (topLeft.y + botRight.y) * 0.5,
-          zoom: nextZoom,
+          zoom: zoomLevels[chosenIdx].zoom,
         });
       },
       exportPng: () => {
-        const outW = 2400;
-        const outH = 1560;
+        const outW = 1920;
+        const outH = 1248;
+        const mapH = 1152;
         const off = document.createElement('canvas');
         off.width = outW;
         off.height = outH;
         const ctx = off.getContext('2d')!;
-        const mapZoom = (outW * 0.94) / activeWidth;
 
         ctx.save();
         ctx.beginPath();
-        ctx.rect(0, 0, outW, 1440);
+        ctx.rect(0, 0, outW, mapH);
         ctx.clip();
         renderMap(
           ctx,
           outW,
-          1440,
+          mapH,
           {
-            cx: activeWidth * 0.5,
-            cy: activeHeight * 0.49,
-            zoom: mapZoom,
+            cx: camera.cx,
+            cy: camera.cy,
+            zoom: camera.zoom * (outW / Math.max(1, viewportSize.width)),
           },
           true
         );
@@ -3869,43 +4756,45 @@ export const CzechMapCanvas = forwardRef<
 
         // Footer cartouche
         ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 1440, outW, 120);
+        ctx.fillRect(0, mapH, outW, outH - mapH);
         ctx.strokeStyle = '#D6D3C9';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(0, 1440);
-        ctx.lineTo(outW, 1440);
+        ctx.moveTo(0, mapH);
+        ctx.lineTo(outW, mapH);
         ctx.stroke();
 
         ctx.fillStyle = '#1A1F1C';
-        ctx.font = '700 32px "Outfit", sans-serif';
+        ctx.font = '700 26px "Outfit", sans-serif';
         ctx.fillText(
           mapScope === 'world'
             ? 'Fyzická a batymetrická mapa světa — Kartografický atlas'
             : 'Česká republika — Topografický mapový podklad',
-          48,
-          1492
+          38,
+          mapH + 42
         );
 
         ctx.fillStyle = '#545E58';
-        ctx.font = '500 18px "Plus Jakarta Sans", sans-serif';
+        ctx.font = '500 15px "Plus Jakarta Sans", sans-serif';
         ctx.fillText(
           mapScope === 'world'
             ? 'Globální reliéf a batymetrie oceánů · 240 států · Vodní síť · Světové metropole a velehorstva · WGS84'
             : 'Reliéfní hypsometrie · Stínovaný terén · Vodní síť · Silniční tahy · Vrstevnice 10–200 m · WGS84',
-          48,
-          1528
+          38,
+          mapH + 72
         );
 
-        const sb = pickScaleBar(mapZoom);
-        const sbX = outW - sb.px - 60;
+        const sb = pickScaleBar(camera.zoom * (outW / Math.max(1, viewportSize.width)));
+        const sbX = outW - sb.px - 48;
         ctx.fillStyle = '#1A1F1C';
-        ctx.fillRect(sbX, 1510, sb.px, 7);
-        ctx.font = '500 18px "JetBrains Mono", monospace';
+        ctx.fillRect(sbX, mapH + 56, sb.px, 6);
+        ctx.font = '500 15px "JetBrains Mono", monospace';
         ctx.textAlign = 'right';
-        ctx.fillText(sb.label, outW - 60, 1496);
+        ctx.fillText(sb.label, outW - 48, mapH + 44);
 
         const url = off.toDataURL('image/png');
+        off.width = 0;
+        off.height = 0;
         const a = document.createElement('a');
         a.href = url;
         a.download =
@@ -3919,10 +4808,10 @@ export const CzechMapCanvas = forwardRef<
       mapScope,
       activeWidth,
       activeHeight,
-      minZoom,
-      maxZoom,
+      activeZoomIndex,
+      zoomLevels,
+      setZoomToLevelIndex,
       projectGeo,
-      fitZoom,
       renderMap,
       stylePreset,
       viewportSize,
@@ -4256,17 +5145,6 @@ export const CzechMapCanvas = forwardRef<
     const sy = e.clientY - rect.top;
     const wPt = screenToWorld(sx, sy);
 
-    if (
-      wPt.x >= 0 &&
-      wPt.x <= activeWidth &&
-      wPt.y >= 0 &&
-      wPt.y <= activeHeight
-    ) {
-      setCursorWorld(wPt);
-    } else {
-      setCursorWorld(null);
-    }
-
     if (dragRef.current.active) {
       const dx = e.clientX - dragRef.current.startX;
       const dy = e.clientY - dragRef.current.startY;
@@ -4280,11 +5158,34 @@ export const CzechMapCanvas = forwardRef<
           cy: dragRef.current.startCy - dy / c.zoom,
         }));
       }
-    } else {
-      const hit = findNearestFeature(wPt.x, wPt.y);
-      const hitGpx = !hit ? findNearestGpxTrack(wPt.x, wPt.y) : null;
-      setHoveredEntity(hit?.title ?? hitGpx);
+      return;
     }
+
+    const now = performance.now();
+    if (now - lastHoverCheckRef.current < 120) return;
+    lastHoverCheckRef.current = now;
+
+    if (
+      wPt.x >= 0 &&
+      wPt.x <= activeWidth &&
+      wPt.y >= 0 &&
+      wPt.y <= activeHeight
+    ) {
+      setCursorWorld((prev) => {
+        if (
+          prev &&
+          Math.hypot(prev.x - wPt.x, prev.y - wPt.y) * camera.zoom < 2.5
+        ) {
+          return prev;
+        }
+        return wPt;
+      });
+    } else {
+      setCursorWorld((prev) => (prev === null ? null : null));
+    }
+
+    const hitGpx = findNearestGpxTrack(wPt.x, wPt.y);
+    setHoveredEntity((prev) => (prev === hitGpx ? prev : hitGpx));
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -4396,21 +5297,20 @@ export const CzechMapCanvas = forwardRef<
 
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
+    const now = performance.now();
+    if (now - wheelCooldownRef.current < 135) return;
+
+    wheelAccumRef.current += e.deltaY;
+    if (Math.abs(wheelAccumRef.current) < 12) return;
+
+    const direction = wheelAccumRef.current < 0 ? 1 : -1;
+    wheelAccumRef.current = 0;
+    wheelCooldownRef.current = now;
+
     const rect = e.currentTarget.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
-    const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
-
-    setCamera((c) => {
-      const nextZoom = Math.max(minZoom, Math.min(maxZoom, c.zoom * factor));
-      const wx = c.cx + (sx - viewportSize.width / 2) / c.zoom;
-      const wy = c.cy + (sy - viewportSize.height / 2) / c.zoom;
-      return {
-        zoom: nextZoom,
-        cx: wx - (sx - viewportSize.width / 2) / nextZoom,
-        cy: wy - (sy - viewportSize.height / 2) / nextZoom,
-      };
-    });
+    setZoomToLevelIndex(activeZoomIndex + direction, sx, sy);
   };
 
   const scaleBar = useMemo(() => pickScaleBar(camera.zoom), [camera.zoom]);
@@ -4461,19 +5361,10 @@ export const CzechMapCanvas = forwardRef<
 
   const activeBlockBadge = useMemo(() => {
     if (mapScope === 'cz') {
-      const tl = worldToGeo(
-        camera.cx - (viewportSize.width * 0.56) / camera.zoom,
-        camera.cy - (viewportSize.height * 0.56) / camera.zoom
-      );
-      const br = worldToGeo(
-        camera.cx + (viewportSize.width * 0.56) / camera.zoom,
-        camera.cy + (viewportSize.height * 0.56) / camera.zoom
-      );
-      const z = pickOsmVectorZoom(Math.abs(br.lon - tl.lon), 7, 14);
-      return `· Detailní podklad OSM z${z}`;
+      return `· Stupeň ${activeZoomLevel.level}/${zoomLevels.length} (${activeZoomLevel.label}) · OSM z${activeZoomLevel.osmZ ?? 7}`;
     }
-    if (camera.zoom < DETAIL_WORLD_ZOOM) {
-      return '· Detailní podklad OSM od 1 : 3 000 000';
+    if (activeZoomLevel.osmZ === null) {
+      return `· Stupeň ${activeZoomLevel.level}/${zoomLevels.length} (${activeZoomLevel.label}) · Detail OSM od stupně 6`;
     }
     const tl = globalWorldToGeo(
       camera.cx - (viewportSize.width * 0.56) / camera.zoom,
@@ -4487,26 +5378,24 @@ export const CzechMapCanvas = forwardRef<
     const maxLon = Math.max(tl.lon, br.lon);
     const minLat = Math.min(tl.lat, br.lat);
     const maxLat = Math.max(tl.lat, br.lat);
-    const z = pickOsmVectorZoom(maxLon - minLon, 7, 14);
-    const { loadedBlocks, activeMetas, loadingCount } =
-      ensureWorldDetailBlocksForViewport(
-        worldPlacesIndex,
-        minLon,
-        maxLon,
-        minLat,
-        maxLat,
-        () => setBlockRevision((v) => v + 1),
-        1.8
-      );
+    const activeMetas = worldPlacesIndex
+      ? getIntersectingWorldBlocks(
+          worldPlacesIndex,
+          minLon,
+          maxLon,
+          minLat,
+          maxLat,
+          1.8
+        )
+      : [];
     const primaryCode = activeMetas[0]?.code ?? 'OCEÁN';
-    if (loadingCount > 0) {
-      return `· Načítání bloku ${primaryCode} (${loadedBlocks.length}/${activeMetas.length})`;
-    }
-    return `· Blok ${primaryCode}${
+    return `· Stupeň ${activeZoomLevel.level}/${zoomLevels.length} · Blok ${primaryCode}${
       activeMetas.length > 1 ? ` +${activeMetas.length - 1}` : ''
-    } · OSM z${z}`;
+    } · OSM z${activeZoomLevel.osmZ}`;
   }, [
     mapScope,
+    activeZoomLevel,
+    zoomLevels.length,
     camera.cx,
     camera.cy,
     camera.zoom,
@@ -4520,7 +5409,7 @@ export const CzechMapCanvas = forwardRef<
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full overflow-hidden select-none bg-[#E6E3D9]"
+      className="relative w-full h-full overflow-hidden select-none bg-[#F5F3EB]"
     >
       <canvas
         ref={canvasRef}
@@ -4543,34 +5432,37 @@ export const CzechMapCanvas = forwardRef<
         className="block w-full h-full touch-none"
       />
 
-      {/* Top-right Navigation Controls */}
-      <div className="absolute top-4 right-4 flex flex-col gap-1.5 z-10">
+      {/* Top-right Navigation & Fixed Zoom Level Controls */}
+      <div className="absolute top-4 right-4 flex flex-col items-end gap-1.5 z-10">
         <div className="flex flex-col bg-white/95 backdrop-blur-sm border border-[#1C2420]/12 rounded-lg shadow-sm overflow-hidden">
           <button
             type="button"
-            onClick={() =>
-              setCamera((c) => ({
-                ...c,
-                zoom: Math.min(maxZoom, c.zoom * 1.35),
-              }))
-            }
-            title="Přiblížit"
+            disabled={activeZoomIndex >= zoomLevels.length - 1}
+            onClick={() => setZoomToLevelIndex(activeZoomIndex + 1)}
+            title="Přiblížit o 1 stupeň"
             aria-label="Přiblížit mapu"
-            className="w-10 h-10 flex items-center justify-center text-[#1C2420] hover:bg-[#F2F0E8] transition-colors border-b border-[#1C2420]/10"
+            className="w-10 h-10 flex items-center justify-center text-[#1C2420] hover:bg-[#F2F0E8] disabled:opacity-35 disabled:hover:bg-transparent transition-colors border-b border-[#1C2420]/10"
           >
             <Plus className="w-4 h-4" />
           </button>
           <button
             type="button"
-            onClick={() =>
-              setCamera((c) => ({
-                ...c,
-                zoom: Math.max(minZoom, c.zoom / 1.35),
-              }))
-            }
-            title="Oddálit"
+            onClick={() => setZoomMenuOpen((v) => !v)}
+            title={`Pevný stupeň přiblížení ${activeZoomLevel.level} z ${zoomLevels.length} (${activeZoomLevel.label})`}
+            aria-label="Vybrat stupeň přiblížení"
+            className="w-10 h-9 flex flex-col items-center justify-center text-[#1E5631] bg-[#F5F8F4] hover:bg-[#E8F2EC] transition-colors border-b border-[#1C2420]/10"
+          >
+            <span className="text-[11px] font-mono-tabular font-bold leading-none">
+              {activeZoomLevel.level}/{zoomLevels.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            disabled={activeZoomIndex <= 0}
+            onClick={() => setZoomToLevelIndex(activeZoomIndex - 1)}
+            title="Oddálit o 1 stupeň"
             aria-label="Oddálit mapu"
-            className="w-10 h-10 flex items-center justify-center text-[#1C2420] hover:bg-[#F2F0E8] transition-colors border-b border-[#1C2420]/10"
+            className="w-10 h-10 flex items-center justify-center text-[#1C2420] hover:bg-[#F2F0E8] disabled:opacity-35 disabled:hover:bg-transparent transition-colors border-b border-[#1C2420]/10"
           >
             <Minus className="w-4 h-4" />
           </button>
@@ -4580,7 +5472,7 @@ export const CzechMapCanvas = forwardRef<
               setCamera({
                 cx: activeWidth * 0.5,
                 cy: activeHeight * 0.49,
-                zoom: fitZoom,
+                zoom: zoomLevels[0].zoom,
               })
             }
             title={
@@ -4594,6 +5486,44 @@ export const CzechMapCanvas = forwardRef<
             <LocateFixed className="w-4 h-4" />
           </button>
         </div>
+
+        {zoomMenuOpen && (
+          <div className="w-48 bg-white/97 backdrop-blur-sm border border-[#1C2420]/15 rounded-lg shadow-lg p-1.5 max-h-[340px] overflow-y-auto">
+            <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#5B6760]">
+              Stupně přiblížení
+            </div>
+            {zoomLevels.map((lvl, idx) => {
+              const active = idx === activeZoomIndex;
+              return (
+                <button
+                  key={lvl.level}
+                  type="button"
+                  onClick={() => {
+                    setZoomToLevelIndex(idx);
+                    setZoomMenuOpen(false);
+                  }}
+                  className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-left text-xs transition-colors ${
+                    active
+                      ? 'bg-[#E8F2EC] text-[#1E5631] font-semibold'
+                      : 'text-[#1C2420] hover:bg-[#F5F3EC]'
+                  }`}
+                >
+                  <span className="truncate">
+                    <span className="font-mono-tabular mr-1.5">
+                      {lvl.level}.
+                    </span>
+                    {lvl.label}
+                  </span>
+                  {lvl.osmZ !== null && (
+                    <span className="text-[10px] font-mono-tabular text-[#5B6760] ml-1 shrink-0">
+                      z{lvl.osmZ}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         <div
           title="Sever"

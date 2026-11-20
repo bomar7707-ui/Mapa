@@ -8,14 +8,37 @@ import {
   sampleWorldElevationWithTiles,
 } from './realCzechData';
 
-// 1 degree = 100,000 metric units (~111 km at equator)
+// 1 degree lon = 100,000 metric units; non-linear latitude projection preserves true 1:1 conformal aspect ratio in mid-latitudes (e.g. Czechia at ~50°N)
 export const GLOBAL_WIDTH = 36_000_000;
-export const GLOBAL_HEIGHT = 17_000_000;
+export const GLOBAL_HEIGHT = 21_500_000;
 
 export const WORLD_DEM_COLS = 640;
-export const WORLD_DEM_ROWS = 320;
+export const WORLD_DEM_ROWS = 380;
 export const WORLD_CELL_X = GLOBAL_WIDTH / (WORLD_DEM_COLS - 1);
 export const WORLD_CELL_Y = GLOBAL_HEIGHT / (WORLD_DEM_ROWS - 1);
+
+// Calibrated latitude projection factor k = 0.805 so dy/dx at lat=49.8°N equals 1/cos(49.8°) ≈ 1.5499 (matching Czechia's exact metric aspect ratio)
+const LAT_PROJ_K = 0.805;
+const LAT_PROJ_MAX = Math.atanh(
+  LAT_PROJ_K * Math.sin((WORLD_GEO_BOUNDS.maxLat * Math.PI) / 180)
+);
+
+function projectLatNorm(lat: number): number {
+  const clamped = Math.max(
+    WORLD_GEO_BOUNDS.minLat,
+    Math.min(WORLD_GEO_BOUNDS.maxLat, lat)
+  );
+  const s = Math.sin((clamped * Math.PI) / 180);
+  const yProj = Math.atanh(LAT_PROJ_K * s);
+  return (LAT_PROJ_MAX - yProj) / (2 * LAT_PROJ_MAX);
+}
+
+function unprojectLatNorm(normY: number): number {
+  const clampedNorm = Math.max(0, Math.min(1, normY));
+  const yProj = LAT_PROJ_MAX * (1 - 2 * clampedNorm);
+  const sinLat = Math.max(-1, Math.min(1, Math.tanh(yProj) / LAT_PROJ_K));
+  return (Math.asin(sinLat) * 180) / Math.PI;
+}
 
 export interface CompiledWorldTerrain {
   elevationGrid: Float32Array;
@@ -31,10 +54,7 @@ export function geoToGlobalWorld(lon: number, lat: number): Point2D {
     ((lon - WORLD_GEO_BOUNDS.minLon) /
       (WORLD_GEO_BOUNDS.maxLon - WORLD_GEO_BOUNDS.minLon)) *
     GLOBAL_WIDTH;
-  const y =
-    ((WORLD_GEO_BOUNDS.maxLat - lat) /
-      (WORLD_GEO_BOUNDS.maxLat - WORLD_GEO_BOUNDS.minLat)) *
-    GLOBAL_HEIGHT;
+  const y = projectLatNorm(lat) * GLOBAL_HEIGHT;
   return { x, y };
 }
 
@@ -45,9 +65,7 @@ export function globalWorldToGeo(
   const lon =
     WORLD_GEO_BOUNDS.minLon +
     (x / GLOBAL_WIDTH) * (WORLD_GEO_BOUNDS.maxLon - WORLD_GEO_BOUNDS.minLon);
-  const lat =
-    WORLD_GEO_BOUNDS.maxLat -
-    (y / GLOBAL_HEIGHT) * (WORLD_GEO_BOUNDS.maxLat - WORLD_GEO_BOUNDS.minLat);
+  const lat = unprojectLatNorm(y / GLOBAL_HEIGHT);
   return { lon, lat };
 }
 
@@ -137,14 +155,26 @@ export function compileWorldTerrain(
   const elevationGrid = new Float32Array(count);
   const forestGrid = new Float32Array(count);
 
+  if (!worldDem) {
+    elevationGrid.fill(-1200);
+    const hillshadeGrid = new Float32Array(count);
+    hillshadeGrid.fill(0.67);
+    return {
+      elevationGrid,
+      hillshadeGrid,
+      forestGrid,
+      contours: [],
+      minElevation: -9337,
+      maxElevation: 8849,
+    };
+  }
+
   let minElevation = Infinity;
   let maxElevation = -Infinity;
 
   for (let r = 0; r < WORLD_DEM_ROWS; r++) {
     const y = r * WORLD_CELL_Y;
-    const lat =
-      WORLD_GEO_BOUNDS.maxLat -
-      (y / GLOBAL_HEIGHT) * (WORLD_GEO_BOUNDS.maxLat - WORLD_GEO_BOUNDS.minLat);
+    const lat = unprojectLatNorm(y / GLOBAL_HEIGHT);
 
     for (let c = 0; c < WORLD_DEM_COLS; c++) {
       const x = c * WORLD_CELL_X;
@@ -154,9 +184,7 @@ export function compileWorldTerrain(
           (WORLD_GEO_BOUNDS.maxLon - WORLD_GEO_BOUNDS.minLon);
 
       const idx = r * WORLD_DEM_COLS + c;
-      const e = worldDem
-        ? sampleWorldDemBilinear(worldDem, lon, lat)
-        : fbm2D(lon * 0.05, lat * 0.05, 101, 4) * 1800;
+      const e = sampleWorldDemBilinear(worldDem, lon, lat);
 
       elevationGrid[idx] = e;
       forestGrid[idx] = evaluateWorldForestBiome(lon, lat, e);
@@ -251,8 +279,8 @@ export function compileWorldViewportTerrain(
   preferredTileZ?: number,
   czDem?: RealDemGrid | null
 ): LocalTerrainPatch {
-  const cols = 280;
-  const rows = 180;
+  const cols = 210;
+  const rows = 136;
   const count = cols * rows;
   const elevationGrid = new Float32Array(count);
   const forestGrid = new Float32Array(count);
@@ -262,10 +290,7 @@ export function compileWorldViewportTerrain(
 
   for (let r = 0; r < rows; r++) {
     const wy = y0 + r * dy;
-    const lat =
-      WORLD_GEO_BOUNDS.maxLat -
-      (wy / GLOBAL_HEIGHT) *
-        (WORLD_GEO_BOUNDS.maxLat - WORLD_GEO_BOUNDS.minLat);
+    const lat = unprojectLatNorm(wy / GLOBAL_HEIGHT);
 
     for (let c = 0; c < cols; c++) {
       const wx = x0 + c * dx;
@@ -309,25 +334,29 @@ export function compileWorldViewportTerrain(
   );
 
   const minorInterval =
-    zoom >= 0.032
-      ? 20
-      : zoom >= 0.012
-        ? 50
-        : zoom >= 0.004
-          ? 100
-          : zoom >= 0.00125
-            ? 200
-            : 400;
+    zoom >= 0.045
+      ? 10
+      : zoom >= 0.02
+        ? 20
+        : zoom >= 0.01
+          ? 50
+          : zoom >= 0.004
+            ? 100
+            : zoom >= 0.00125
+              ? 200
+              : 400;
   const majorInterval =
-    zoom >= 0.032
-      ? 100
-      : zoom >= 0.012
-        ? 200
-        : zoom >= 0.004
-          ? 400
-          : zoom >= 0.00125
-            ? 800
-            : 1600;
+    zoom >= 0.045
+      ? 50
+      : zoom >= 0.02
+        ? 100
+        : zoom >= 0.01
+          ? 200
+          : zoom >= 0.004
+            ? 400
+            : zoom >= 0.00125
+              ? 800
+              : 1600;
 
   let contours: ContourLevel[] = [];
   if (withContours) {

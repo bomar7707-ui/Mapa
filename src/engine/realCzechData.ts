@@ -7,8 +7,21 @@ import {
   RealDemGrid,
 } from '../types/map';
 
+const MAX_TERRARIUM_CACHE = 96;
+const MAX_TERRARIUM_VIEWPORT_TILES = 12;
 const TILE_CACHE = new Map<string, Float32Array>();
 const TILE_INFLIGHT = new Map<string, Promise<Float32Array | null>>();
+const FAILED_TERRARIUM_TILES = new Map<string, number>();
+
+function getCachedTerrariumTile(key: string): Float32Array | undefined {
+  const hit = TILE_CACHE.get(key);
+  if (hit) {
+    // Refresh LRU order so active viewport tiles are never evicted
+    TILE_CACHE.delete(key);
+    TILE_CACHE.set(key, hit);
+  }
+  return hit;
+}
 
 function decodeTerrariumImageData(
   imgData: Uint8ClampedArray,
@@ -20,7 +33,8 @@ function decodeTerrariumImageData(
     const r = imgData[p];
     const g = imgData[p + 1];
     const b = imgData[p + 2];
-    out[i] = r * 256 + g + b / 256 - 32768;
+    const raw = r * 256 + g + b / 256 - 32768;
+    out[i] = Math.max(-11500, Math.min(9000, raw));
   }
   return out;
 }
@@ -43,9 +57,14 @@ function loadPngPixels(
       }
       ctx.drawImage(img, 0, 0);
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const w = canvas.width;
+      const h = canvas.height;
+      // Release GPU backing store immediately
+      canvas.width = 0;
+      canvas.height = 0;
       resolve({
-        width: canvas.width,
-        height: canvas.height,
+        width: w,
+        height: h,
         data: imageData.data,
       });
     };
@@ -69,20 +88,26 @@ export function loadRealCzechDataset(): Promise<RealCzechDataset | null> {
   if (cachedDatasetPromise) return cachedDatasetPromise;
   cachedDatasetPromise = (async () => {
     try {
-      const [dem, adminRes, vecRes, placesRes] = await Promise.all([
+      const [dem, adminRes, placesRes] = await Promise.all([
         loadDemPng('/data/cz-dem.png'),
         fetch('/data/cz-admin.json'),
-        fetch('/data/cz-vector.json'),
         fetch('/data/cz-places.json'),
       ]);
-      if (!adminRes.ok || !vecRes.ok || !placesRes.ok) {
+      if (!adminRes.ok || !placesRes.ok) {
         return null;
       }
-      const [admin, vectors, places] = (await Promise.all([
+      const [admin, places] = (await Promise.all([
         adminRes.json(),
-        vecRes.json(),
         placesRes.json(),
-      ])) as [RealCzechAdmin, RealCzechVectors, RealCzechPlaces];
+      ])) as [RealCzechAdmin, RealCzechPlaces];
+
+      const vectors: RealCzechVectors = {
+        rivers: [],
+        lakes: [],
+        roads: [],
+        railways: [],
+        urban: [],
+      };
 
       return { dem, admin, vectors, places };
     } catch {
@@ -129,7 +154,8 @@ function lonToTileFrac(lon: number, z: number): number {
 }
 
 function latToTileFrac(lat: number, z: number): number {
-  const rad = (lat * Math.PI) / 180;
+  const clamped = Math.max(-85.05, Math.min(85.05, lat));
+  const rad = (clamped * Math.PI) / 180;
   return (
     ((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2) *
     (1 << z)
@@ -137,10 +163,35 @@ function latToTileFrac(lat: number, z: number): number {
 }
 
 export function pickTerrariumZoom(cameraZoom: number): number {
-  if (cameraZoom >= 0.085) return 13;
-  if (cameraZoom >= 0.024) return 12;
-  if (cameraZoom >= 0.011) return 11;
+  // Below 0.016, built-in cz-dem.png already exceeds the 220x142 terrain patch resolution
+  if (cameraZoom < 0.016) return 0;
+  if (cameraZoom >= 0.085) return 12;
+  if (cameraZoom >= 0.036) return 11;
   return 10;
+}
+
+function clampTerrariumZoomToViewport(
+  minLon: number,
+  maxLon: number,
+  minLat: number,
+  maxLat: number,
+  targetZ: number,
+  minZ: number
+): number {
+  if (targetZ < minZ) return 0;
+  let z = targetZ;
+  while (z >= minZ) {
+    const tx0 = Math.floor(lonToTileFrac(minLon, z));
+    const tx1 = Math.floor(lonToTileFrac(maxLon, z));
+    const ty0 = Math.floor(latToTileFrac(maxLat, z));
+    const ty1 = Math.floor(latToTileFrac(minLat, z));
+    const count = Math.max(1, tx1 - tx0 + 1) * Math.max(1, ty1 - ty0 + 1);
+    if (count <= MAX_TERRARIUM_VIEWPORT_TILES) {
+      return z;
+    }
+    z--;
+  }
+  return 0;
 }
 
 function fetchTerrariumTile(
@@ -149,8 +200,13 @@ function fetchTerrariumTile(
   ty: number
 ): Promise<Float32Array | null> {
   const key = `${z}/${tx}/${ty}`;
-  const existing = TILE_CACHE.get(key);
+  const existing = getCachedTerrariumTile(key);
   if (existing) return Promise.resolve(existing);
+
+  const retryAfter = FAILED_TERRARIUM_TILES.get(key);
+  if (retryAfter && Date.now() < retryAfter) {
+    return Promise.resolve(null);
+  }
 
   const inflight = TILE_INFLIGHT.get(key);
   if (inflight) return inflight;
@@ -159,7 +215,7 @@ function fetchTerrariumTile(
   const p = loadPngPixels(url, 'anonymous')
     .then(({ width, height, data }) => {
       const grid = decodeTerrariumImageData(data, width * height);
-      if (TILE_CACHE.size > 320) {
+      if (TILE_CACHE.size >= MAX_TERRARIUM_CACHE) {
         const firstKey = TILE_CACHE.keys().next().value;
         if (firstKey) TILE_CACHE.delete(firstKey);
       }
@@ -168,6 +224,7 @@ function fetchTerrariumTile(
       return grid;
     })
     .catch(() => {
+      FAILED_TERRARIUM_TILES.set(key, Date.now() + 30000);
       TILE_INFLIGHT.delete(key);
       return null;
     });
@@ -183,31 +240,41 @@ export async function ensureViewportTerrariumTiles(
   maxLat: number,
   z: number
 ): Promise<boolean> {
-  const tx0 = Math.floor(lonToTileFrac(minLon, z));
-  const tx1 = Math.floor(lonToTileFrac(maxLon, z));
-  const ty0 = Math.floor(latToTileFrac(maxLat, z));
-  const ty1 = Math.floor(latToTileFrac(minLat, z));
+  const effectiveZ = clampTerrariumZoomToViewport(
+    minLon,
+    maxLon,
+    minLat,
+    maxLat,
+    z,
+    7
+  );
+  if (effectiveZ <= 0) return false;
+
+  const tx0 = Math.floor(lonToTileFrac(minLon, effectiveZ));
+  const tx1 = Math.floor(lonToTileFrac(maxLon, effectiveZ));
+  const ty0 = Math.floor(latToTileFrac(maxLat, effectiveZ));
+  const ty1 = Math.floor(latToTileFrac(minLat, effectiveZ));
 
   const jobs: Promise<Float32Array | null>[] = [];
   let loadedAnyNew = false;
 
-  for (let ty = ty0; ty <= ty1; ty++) {
-    for (let tx = tx0; tx <= tx1; tx++) {
-      const key = `${z}/${tx}/${ty}`;
-      if (!TILE_CACHE.has(key)) {
-        jobs.push(
-          fetchTerrariumTile(z, tx, ty).then((res) => {
-            if (res) loadedAnyNew = true;
-            return res;
-          })
-        );
-      }
+  for (let ty = ty0; ty <= ty1 && jobs.length < MAX_TERRARIUM_VIEWPORT_TILES; ty++) {
+    for (let tx = tx0; tx <= tx1 && jobs.length < MAX_TERRARIUM_VIEWPORT_TILES; tx++) {
+      const key = `${effectiveZ}/${tx}/${ty}`;
+      if (getCachedTerrariumTile(key)) continue;
+      const retryAfter = FAILED_TERRARIUM_TILES.get(key);
+      if (retryAfter && Date.now() < retryAfter) continue;
+      jobs.push(
+        fetchTerrariumTile(effectiveZ, tx, ty).then((res) => {
+          if (res) loadedAnyNew = true;
+          return res;
+        })
+      );
     }
   }
 
   if (jobs.length === 0) return false;
-  // Cap parallel tiles in case of extreme bounds
-  await Promise.all(jobs.slice(0, 36));
+  await Promise.all(jobs);
   return loadedAnyNew;
 }
 
@@ -228,7 +295,7 @@ export function sampleElevationWithTiles(
     const getPx = (gx: number, gy: number): number | null => {
       const tx = Math.floor(gx / 256);
       const ty = Math.floor(gy / 256);
-      const tile = TILE_CACHE.get(`${preferredZ}/${tx}/${ty}`);
+      const tile = getCachedTerrariumTile(`${preferredZ}/${tx}/${ty}`);
       if (!tile) return null;
       const lx = ((gx % 256) + 256) % 256;
       const ly = ((gy % 256) + 256) % 256;
@@ -381,6 +448,7 @@ export function loadWorldPlacesIndex(): Promise<
   return cachedWorldPlacesIndexPromise;
 }
 
+const MAX_WORLD_BLOCK_CACHE = 32;
 const WORLD_BLOCK_CACHE = new Map<
   string,
   import('../types/map').WorldDetailBlock
@@ -389,23 +457,28 @@ const WORLD_BLOCK_INFLIGHT = new Map<
   string,
   Promise<import('../types/map').WorldDetailBlock | null>
 >();
+const FAILED_WORLD_BLOCKS = new Set<string>();
 
 function fetchWorldDetailBlock(
   blockId: string
 ): Promise<import('../types/map').WorldDetailBlock | null> {
   const existing = WORLD_BLOCK_CACHE.get(blockId);
   if (existing) return Promise.resolve(existing);
+  if (FAILED_WORLD_BLOCKS.has(blockId)) return Promise.resolve(null);
 
   const inflight = WORLD_BLOCK_INFLIGHT.get(blockId);
   if (inflight) return inflight;
 
   const p = fetch(`/data/world-blocks/${blockId}.json`)
     .then(async (res) => {
-      if (!res.ok) return null;
+      if (!res.ok) {
+        FAILED_WORLD_BLOCKS.add(blockId);
+        WORLD_BLOCK_INFLIGHT.delete(blockId);
+        return null;
+      }
       const blk =
         (await res.json()) as import('../types/map').WorldDetailBlock;
-      // Keep an LRU cache of up to 36 logical blocks
-      if (WORLD_BLOCK_CACHE.size > 36) {
+      if (WORLD_BLOCK_CACHE.size >= MAX_WORLD_BLOCK_CACHE) {
         const oldestKey = WORLD_BLOCK_CACHE.keys().next().value;
         if (oldestKey) WORLD_BLOCK_CACHE.delete(oldestKey);
       }
@@ -414,6 +487,7 @@ function fetchWorldDetailBlock(
       return blk;
     })
     .catch(() => {
+      FAILED_WORLD_BLOCKS.add(blockId);
       WORLD_BLOCK_INFLIGHT.delete(blockId);
       return null;
     });
@@ -428,7 +502,7 @@ export function getIntersectingWorldBlocks(
   maxLon: number,
   minLat: number,
   maxLat: number,
-  marginDeg = 1.8
+  marginDeg = 1.2
 ): import('../types/map').WorldBlockMeta[] {
   const deg = index.blockSizeDeg || 15;
   const cols = index.cols || 24;
@@ -469,7 +543,7 @@ export function getIntersectingWorldBlocks(
     return da - db;
   });
 
-  return metas;
+  return metas.slice(0, 9);
 }
 
 export function ensureWorldDetailBlocksForViewport(
@@ -479,7 +553,7 @@ export function ensureWorldDetailBlocksForViewport(
   minLat: number,
   maxLat: number,
   onBlockLoaded: () => void,
-  marginDeg = 1.8
+  marginDeg = 1.2
 ): {
   loadedBlocks: import('../types/map').WorldDetailBlock[];
   activeMetas: import('../types/map').WorldBlockMeta[];
@@ -508,6 +582,7 @@ export function ensureWorldDetailBlocksForViewport(
   let loadingCount = 0;
 
   for (const meta of activeMetas) {
+    if (FAILED_WORLD_BLOCKS.has(meta.id)) continue;
     const cached = WORLD_BLOCK_CACHE.get(meta.id);
     if (cached) {
       // Refresh LRU position
@@ -536,15 +611,13 @@ export function ensureWorldDetailBlocksForViewport(
 }
 
 export function pickWorldTerrariumZoom(cameraZoom: number): number {
-  // Scale 1 : 3,000,000 corresponds to cameraZoom ~ 0.00126
-  if (cameraZoom >= 0.085) return 13;
-  if (cameraZoom >= 0.032) return 12;
-  if (cameraZoom >= 0.015) return 11;
-  if (cameraZoom >= 0.006) return 10;
-  if (cameraZoom >= 0.00125) return 9;
-  if (cameraZoom >= 0.0007) return 7;
-  if (cameraZoom >= 0.00035) return 6;
-  return 5;
+  // Below 0.0045, built-in world-dem.png + cz-dem.png provide stable overview elevation without tile-boundary shifts
+  if (cameraZoom < 0.0045) return 0;
+  if (cameraZoom >= 0.085) return 12;
+  if (cameraZoom >= 0.036) return 11;
+  if (cameraZoom >= 0.016) return 10;
+  if (cameraZoom >= 0.008) return 9;
+  return 8;
 }
 
 export function sampleWorldElevationWithTiles(
@@ -556,7 +629,7 @@ export function sampleWorldElevationWithTiles(
 ): number {
   const clampedLat = Math.max(-85, Math.min(85, lat));
   const clampedLon = Math.max(-180, Math.min(180, lon));
-  if (preferredZ && preferredZ >= 5) {
+  if (preferredZ && preferredZ >= 7) {
     const n = 1 << preferredZ;
     const pxG = lonToTileFrac(clampedLon, preferredZ) * 256;
     const pyG = latToTileFrac(clampedLat, preferredZ) * 256;
@@ -570,7 +643,7 @@ export function sampleWorldElevationWithTiles(
       const gyClamp = Math.max(0, Math.min(n * 256 - 1, gy));
       const tx = Math.floor(gxWrap / 256);
       const ty = Math.floor(gyClamp / 256);
-      const tile = TILE_CACHE.get(`${preferredZ}/${tx}/${ty}`);
+      const tile = getCachedTerrariumTile(`${preferredZ}/${tx}/${ty}`);
       if (!tile) return null;
       const lx = gxWrap % 256;
       const ly = gyClamp % 256;

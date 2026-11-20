@@ -68,6 +68,7 @@ interface CzechSidebarProps {
   onFocusGpxTrack: (track: ImportedGpxTrack) => void;
   onRemoveGpxTrack: (id: string) => void;
   onClearGpxError: () => void;
+  onNeedSearchIndexes?: () => void;
 }
 
 const STYLE_PRESETS: { id: MapStylePreset; label: string; desc: string }[] = [
@@ -237,6 +238,7 @@ export const CzechSidebar: React.FC<CzechSidebarProps> = ({
   onFocusGpxTrack,
   onRemoveGpxTrack,
   onClearGpxError,
+  onNeedSearchIndexes,
 }) => {
   const [search, setSearch] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -597,7 +599,13 @@ export const CzechSidebar: React.FC<CzechSidebarProps> = ({
           <input
             type="text"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value;
+              setSearch(next);
+              if (next.trim() !== '') {
+                onNeedSearchIndexes?.();
+              }
+            }}
             placeholder={
               mapScope === 'world'
                 ? 'Hledat stát, metropoli, horu...'
@@ -856,16 +864,7 @@ export const CzechSidebar: React.FC<CzechSidebarProps> = ({
           </h3>
           {mapScope === 'world' ? (
             <>
-              <div className="h-3 rounded-sm overflow-hidden flex border border-[#1C2420]/15">
-                <div className="flex-1 bg-[#2B5C8F]" />
-                <div className="flex-1 bg-[#4F8BC2]" />
-                <div className="flex-1 bg-[#88BCE6]" />
-                <div className="flex-1 bg-[#AFD494]" />
-                <div className="flex-1 bg-[#E7EBB8]" />
-                <div className="flex-1 bg-[#E0BA82]" />
-                <div className="flex-1 bg-[#AE6E48]" />
-                <div className="flex-1 bg-[#EDEAE4]" />
-              </div>
+              <div className="h-3 rounded-sm overflow-hidden border border-[#1C2420]/15 bg-[linear-gradient(90deg,#68A8E0_0%,#86C1EF_16%,#BCE6FE_30%,#C6E0B4_35%,#F1F3E7_46%,#F3F0E4_58%,#ECE7D8_70%,#E4DDD0_82%,#ECE9E1_91%,#FDFEFF_100%)]" />
               <div className="flex justify-between text-[10px] font-mono-tabular text-[#5B6760] mt-1">
                 <span>−8 000 m</span>
                 <span>0 m</span>
@@ -876,16 +875,7 @@ export const CzechSidebar: React.FC<CzechSidebarProps> = ({
             </>
           ) : (
             <>
-              <div className="h-3 rounded-sm overflow-hidden flex border border-[#1C2420]/15">
-                <div className="flex-1 bg-[#AFD494]" />
-                <div className="flex-1 bg-[#CAE2A8]" />
-                <div className="flex-1 bg-[#E7EBB8]" />
-                <div className="flex-1 bg-[#EEDBA4]" />
-                <div className="flex-1 bg-[#E0BA82]" />
-                <div className="flex-1 bg-[#CA9160]" />
-                <div className="flex-1 bg-[#AE6E48]" />
-                <div className="flex-1 bg-[#945C44]" />
-              </div>
+              <div className="h-3 rounded-sm overflow-hidden border border-[#1C2420]/15 bg-[linear-gradient(90deg,#C5E0B0_0%,#D6E8C4_16%,#F0F3E7_32%,#F4F2E7_48%,#EFECE0_64%,#E8E3D4_80%,#E2DDD0_92%,#EAE7DA_100%)]" />
               <div className="flex justify-between text-[10px] font-mono-tabular text-[#5B6760] mt-1">
                 <span>115 m</span>
                 <span>350 m</span>
@@ -970,8 +960,8 @@ export const CzechSidebar: React.FC<CzechSidebarProps> = ({
       <div className="px-4 py-3 border-t border-[#1C2420]/10 bg-[#FAF9F5] text-[11px] text-[#5B6760] flex items-center justify-between">
         <span>
           {mapScope === 'world'
-            ? 'Verze 1.0 · Globální WGS84 · SRTM/ETOPO'
-            : 'Verze 1.0 · Projekce WGS84 · ČR'}
+            ? 'Verze 1.2 · Globální WGS84 · SRTM/ETOPO'
+            : 'Verze 1.2 · Projekce WGS84 · ČR'}
         </span>
         <span className="font-mono-tabular">
           {mapScope === 'world' ? '−9 337–8 849 m' : '115–1 603 m'}

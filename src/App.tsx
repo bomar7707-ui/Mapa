@@ -74,27 +74,62 @@ export default function App() {
   const [gpxError, setGpxError] = useState<string | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
 
-  useEffect(() => {
-    let active = true;
+  const mountedRef = useRef(true);
+  const realDatasetRequestedRef = useRef(false);
+  const worldPlacesRequestedRef = useRef(false);
+
+  const ensureRealDataset = useCallback(() => {
+    if (realDatasetRequestedRef.current) return;
+    realDatasetRequestedRef.current = true;
     loadRealCzechDataset().then((ds) => {
-      if (active && ds) {
+      if (mountedRef.current && ds) {
         setRealDataset(ds);
       }
     });
-    loadRealWorldDataset().then((wds) => {
-      if (active && wds) {
-        setWorldDataset(wds);
-      }
-    });
+  }, []);
+
+  const ensureWorldPlacesIndex = useCallback(() => {
+    if (worldPlacesRequestedRef.current) return;
+    worldPlacesRequestedRef.current = true;
     loadWorldPlacesIndex().then((wpi) => {
-      if (active && wpi) {
+      if (mountedRef.current && wpi) {
         setWorldPlacesIndex(wpi);
       }
     });
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    loadRealWorldDataset().then((wds) => {
+      if (mountedRef.current && wds) {
+        setWorldDataset(wds);
+      }
+    });
     return () => {
-      active = false;
+      mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (mapScope === 'cz') {
+      ensureRealDataset();
+    }
+  }, [mapScope, ensureRealDataset]);
+
+  const handleEnterDetailScale = useCallback(
+    (overlapsCz: boolean) => {
+      ensureWorldPlacesIndex();
+      if (overlapsCz) {
+        ensureRealDataset();
+      }
+    },
+    [ensureWorldPlacesIndex, ensureRealDataset]
+  );
+
+  const handleNeedSearchIndexes = useCallback(() => {
+    ensureWorldPlacesIndex();
+    ensureRealDataset();
+  }, [ensureWorldPlacesIndex, ensureRealDataset]);
 
   const terrain = useMemo(
     () => compileCzechTerrain(realDataset?.dem),
@@ -140,6 +175,7 @@ export default function App() {
   const handleImportGpxFile = useCallback(
     async (file: File) => {
       setGpxError(null);
+      ensureRealDataset();
       try {
         const text = await file.text();
         setGpxTracks((prev) => {
@@ -175,7 +211,7 @@ export default function App() {
         setGpxError(msg);
       }
     },
-    [terrain, worldDataset, mapScope]
+    [terrain, worldDataset, mapScope, ensureRealDataset]
   );
 
   const handleToggleGpxVisibility = useCallback((id: string) => {
@@ -260,7 +296,7 @@ export default function App() {
               : 'Mapový podklad ČR'}
           </span>
           <span className="px-1.5 py-0.5 text-[11px] font-mono-tabular font-semibold text-[#1E5631] bg-[#E8F2EC] border border-[#1E5631]/20 rounded">
-            v1.0
+            v1.2
           </span>
         </div>
 
@@ -353,6 +389,7 @@ export default function App() {
             }}
             onRemoveGpxTrack={handleRemoveGpxTrack}
             onClearGpxError={() => setGpxError(null)}
+            onNeedSearchIndexes={handleNeedSearchIndexes}
           />
         </div>
 
@@ -387,6 +424,7 @@ export default function App() {
                 setActiveGpxId(id);
                 setGpxHoverGeo(null);
               }}
+              onEnterDetailScale={handleEnterDetailScale}
             />
 
             {/* Selected Point / City / Peak / Country Floating Inspector */}
